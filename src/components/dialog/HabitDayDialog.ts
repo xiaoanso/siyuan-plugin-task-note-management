@@ -1,0 +1,1143 @@
+import { Dialog, showMessage, confirm } from "siyuan";
+import type { Habit, HabitEmojiConfig as HabitCheckInEmoji } from "../../utils/habitUtils";
+import { isHabitActiveOnDate, isHabitCheckInDayComplete, shouldCheckInOnDate, POMODORO_PER_SESSION_AUTO_CHECKIN_MEANING } from "../../utils/habitUtils";
+import { getLocalDateString, getLocalDateTimeString, getLogicalDateString } from "../../utils/dateUtils";
+import { PomodoroRecordManager, type PomodoroSession } from "../dataManager/pomodoroRecord";
+import { i18n, getPluginInstance } from "../../pluginInstance";
+import { buildLinkedHabitTaskMaps, isEventIdFromTaskWithInstances } from "../../utils/linkedHabitPomodoro";
+import { deleteHabitMemoBlockForEntry, syncHabitMemoBlock, type HabitMemoCheckInEntry, type HabitMemoEmojiConfig } from "../dataManager/habitMemoBlockSync";
+
+type HabitDayEntry = {
+    emoji: string;
+    meaning?: string;
+    timestamp: string;
+    note?: string;
+    group?: string;
+    memoBlockId?: string;
+    memoSyncKey?: string;
+};
+
+type HabitDayPomodoroSessionItem = {
+    session: PomodoroSession;
+    source: "habit" | "task";
+};
+
+export class HabitDayDialog {
+    private dialog: Dialog;
+    private habit: Habit;
+    private dateStr: string;
+    private onSave: (habit: Habit) => Promise<void>;
+    private pomodoroManager: PomodoroRecordManager;
+    private plugin?: any;
+    private renderVersion = 0;
+    private weekStartDay = 1;
+    private weekContainer: HTMLElement;
+
+    constructor(habit: Habit, dateStr: string, onSave: (habit: Habit) => Promise<void>, plugin?: any) {
+        this.habit = habit;
+        this.dateStr = dateStr;
+        this.onSave = onSave;
+        this.plugin = plugin || getPluginInstance();
+        this.pomodoroManager = PomodoroRecordManager.getInstance(this.plugin);
+    }
+
+    show() {
+        this.dialog = new Dialog({
+            title: (this.habit.icon || "") + i18n("dayDialogTitle", { title: this.habit.title, date: this.dateStr }),
+            content: "<div id=\"habitDayEditContainer\"></div>",
+            width: "560px",
+            height: "660px"
+        });
+
+        const container = this.dialog.element.querySelector("#habitDayEditContainer") as HTMLElement;
+        if (!container) return;
+        container.style.cssText = "display: flex; flex-direction: column; height: 100%;";
+
+        this.weekContainer = document.createElement("div");
+        this.weekContainer.className = "habit-day-dialog__week";
+        container.appendChild(this.weekContainer);
+
+        const contentDiv = document.createElement("div");
+        contentDiv.className = "b3-dialog__content";
+        contentDiv.style.cssText = "flex: 1; min-height:0; padding: 16px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px;";
+        container.appendChild(contentDiv);
+
+        const actionDiv = document.createElement("div");
+        actionDiv.className = "b3-dialog__action";
+        actionDiv.style.cssText = "padding: 12px 16px; display: flex; justify-content: flex-end; gap: 8px; border-top: 1px solid var(--b3-border-color);";
+        container.appendChild(actionDiv);
+
+        void this.initializeWeekView(contentDiv, actionDiv);
+    }
+
+    private async initializeWeekView(contentContainer: HTMLElement, actionContainer: HTMLElement) {
+        try {
+            const settings = await this.plugin?.loadSettings?.();
+            if (Number.isInteger(settings?.weekStartDay) && settings.weekStartDay >= 0 && settings.weekStartDay <= 6) {
+                this.weekStartDay = settings.weekStartDay;
+            }
+        } catch (error) {
+            console.warn("Failed to read week start setting:", error);
+        }
+        await this.render(contentContainer, actionContainer);
+    }
+
+    private getWeekDates(): string[] {
+        const selectedDate = new Date(`${this.dateStr}T12:00:00`);
+        const offset = (selectedDate.getDay() - this.weekStartDay + 7) % 7;
+        return Array.from({ length: 7 }, (_, index) => {
+            const day = new Date(selectedDate);
+            day.setDate(selectedDate.getDate() - offset + index);
+            return getLocalDateString(day);
+        });
+    }
+
+    private renderWeekView(contentContainer: HTMLElement, actionContainer?: HTMLElement, sessionsByDate?: Map<string, HabitDayPomodoroSessionItem[]>) {
+        if (!this.weekContainer) return;
+        this.weekContainer.innerHTML = "";
+        const dates = this.getWeekDates();
+        const row = document.createElement("div");
+        row.style.cssText = "display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:8px;";
+        const title = document.createElement("span");
+        title.style.cssText = "font-size:13px; font-weight:600; text-align:center;";
+        title.textContent = `${dates[0]} — ${dates[6]}`;
+        const directions = [
+            { offset: -7, label: i18n("lastWeek"), path: "m15 18-6-6 6-6" },
+            { offset: 7, label: i18n("nextWeek"), path: "m9 6 6 6-6 6" }
+        ];
+        directions.forEach(({ offset, label, path }) => {
+            const button = document.createElement("button");
+            button.type = "button";
+            button.className = "b3-button b3-button--text ariaLabel";
+            button.style.cssText = "width:28px; height:28px; padding:4px; display:inline-flex; align-items:center; justify-content:center;";
+            button.setAttribute("aria-label", label);
+            button.innerHTML = `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${path}"/></svg>`;
+            button.addEventListener("click", event => {
+                event.stopPropagation();
+                const day = new Date(`${this.dateStr}T12:00:00`);
+                day.setDate(day.getDate() + offset);
+                this.dateStr = getLocalDateString(day);
+                contentContainer.scrollTop = 0;
+                void this.render(contentContainer, actionContainer);
+            });
+            row.appendChild(button);
+            if (offset < 0) row.appendChild(title);
+        });
+        this.weekContainer.appendChild(row);
+
+        const week = document.createElement("div");
+        week.className = "habit-card__week-days";
+        const today = getLogicalDateString();
+        const weekdayNames = i18n("weekdayNames").split(",");
+        dates.forEach(date => {
+            const day = new Date(`${date}T12:00:00`);
+            const required = isHabitActiveOnDate(this.habit, date) && shouldCheckInOnDate(this.habit, date);
+            const completed = isHabitCheckInDayComplete(this.habit, date, {
+                getPomodoroFocusMinutes: () => (sessionsByDate?.get(date) || []).reduce((sum, item) => sum + (item.session.duration || 0), 0)
+            });
+            const checkIn = this.habit.checkIns?.[date];
+            const emojis = checkIn?.entries?.length
+                ? checkIn.entries.map(entry => entry.emoji).filter(Boolean)
+                : checkIn?.status?.filter(Boolean) || [];
+            const count = Math.max(emojis.length, checkIn?.count || 0);
+            const button = document.createElement("button");
+            button.type = "button";
+            button.className = "habit-card__week-day";
+            button.dataset.date = date;
+            if (!required) button.classList.add("habit-card__week-day--not-required");
+            if (completed) button.classList.add("habit-card__week-day--done");
+            if (date === today) button.classList.add("habit-card__week-day--today");
+            if (date === this.dateStr) button.classList.add("habit-day-dialog__week-day--selected");
+            button.style.setProperty("--habit-color", this.habit.color || "var(--b3-theme-primary)");
+            button.setAttribute("aria-pressed", String(date === this.dateStr));
+
+            const weekday = document.createElement("span");
+            weekday.className = "habit-card__week-weekday";
+            weekday.textContent = weekdayNames[day.getDay()] || String(day.getDay());
+            const dayNumber = document.createElement("span");
+            dayNumber.className = "habit-card__week-date";
+            dayNumber.textContent = String(day.getDate());
+            const status = document.createElement("span");
+            status.className = "habit-card__week-status";
+            // 与习惯面板一致，兼容只有 count 的历史数据。
+            const displayedEmojis = emojis.length > 0
+                ? emojis
+                : Array.from({ length: Math.min(count, 8) }, () => this.habit.autoCheckInEmoji || "🍅");
+            if (displayedEmojis.length > 0) {
+                status.classList.add(displayedEmojis.length <= 4 ? "habit-card__week-status--few"
+                    : displayedEmojis.length <= 8 ? "habit-card__week-status--medium" : "habit-card__week-status--many");
+                displayedEmojis.forEach(emoji => {
+                    const item = document.createElement("span");
+                    item.textContent = emoji;
+                    status.appendChild(item);
+                });
+                if (count > displayedEmojis.length) {
+                    const remainder = document.createElement("span");
+                    remainder.textContent = `+${count - displayedEmojis.length}`;
+                    status.appendChild(remainder);
+                }
+            } else {
+                status.textContent = completed ? "✓" : "·";
+            }
+            button.append(weekday, dayNumber, status);
+            const checkInState = completed ? i18n("habitWeekCompleted")
+                : count > 0 ? i18n("habitWeekIncomplete")
+                    : required ? i18n("habitWeekMissing") : i18n("habitWeekNotRequired");
+            const description = `${date} ${weekdayNames[day.getDay()] || ""}：${checkInState}${count > 0 ? ` (${count}) ${emojis.join(" ")}` : ""}`;
+            button.title = description;
+            button.setAttribute("aria-label", description);
+            button.addEventListener("click", () => {
+                this.dateStr = date;
+                contentContainer.scrollTop = 0;
+                void this.render(contentContainer, actionContainer);
+            });
+            week.appendChild(button);
+        });
+        this.weekContainer.appendChild(week);
+    }
+
+    private getEntriesForDate(checkIn: any): HabitDayEntry[] {
+        if (!checkIn) return [];
+        if (Array.isArray(checkIn.entries) && checkIn.entries.length > 0) {
+            return checkIn.entries.map((e: any) => ({
+                emoji: e.emoji,
+                meaning: e.meaning || this.getMeaningForEmoji(e.emoji),
+                timestamp: e.timestamp,
+                note: e.note,
+                group: e.group,
+                memoBlockId: e.memoBlockId,
+                memoSyncKey: e.memoSyncKey
+            }));
+        }
+        return (checkIn.status || []).map((s: string) => ({
+            emoji: s,
+            meaning: this.getMeaningForEmoji(s),
+            timestamp: checkIn.timestamp || "",
+            note: ""
+        }));
+    }
+
+    private getMeaningForEmoji(emoji: string | undefined): string | undefined {
+        if (!emoji) return undefined;
+        const configs = this.habit.checkInEmojis || [] as HabitCheckInEmoji[];
+        const cfg = configs.find(c => c.emoji === emoji);
+        return cfg ? cfg.meaning : undefined;
+    }
+
+    private getAvailableCheckInEmojisForDate(dateStr: string): HabitCheckInEmoji[] {
+        const emojiConfigs = this.habit.checkInEmojis || [] as HabitCheckInEmoji[];
+        if (!this.habit.hideCheckedToday) return emojiConfigs;
+
+        const checkIn = this.habit.checkIns?.[dateStr];
+        if (!checkIn) return emojiConfigs;
+
+        const checkedGroups = new Set<string>();
+        const checkedEmojis = new Set<string>();
+        const emojiToGroups = new Map<string, Set<string>>();
+
+        emojiConfigs.forEach(cfg => {
+            const groupName = (cfg.group || "").trim();
+            if (!groupName) return;
+            if (!emojiToGroups.has(cfg.emoji)) emojiToGroups.set(cfg.emoji, new Set<string>());
+            emojiToGroups.get(cfg.emoji)!.add(groupName);
+        });
+
+        this.getEntriesForDate(checkIn).forEach(entry => {
+            checkedEmojis.add(entry.emoji);
+            const groupName = (entry.group || "").trim();
+            if (groupName) {
+                checkedGroups.add(groupName);
+                return;
+            }
+
+            // 兼容旧数据：entry 没有 group 时，用 emoji 配置推断已打卡分组
+            const mappedGroups = emojiToGroups.get(entry.emoji);
+            if (mappedGroups) {
+                mappedGroups.forEach(g => checkedGroups.add(g));
+            }
+        });
+
+        return emojiConfigs.filter(cfg => {
+            const groupName = (cfg.group || "").trim();
+            if (groupName) {
+                return !checkedGroups.has(groupName);
+            }
+            return !checkedEmojis.has(cfg.emoji);
+        });
+    }
+
+    private async setEntriesForDate(dateStr: string, entries: HabitDayEntry[]) {
+        this.habit.checkIns = this.habit.checkIns || {};
+        if (!entries || entries.length === 0) {
+            delete this.habit.checkIns![dateStr];
+            return;
+        }
+        this.habit.checkIns[dateStr] = this.habit.checkIns[dateStr] || { count: 0, status: [], timestamp: "" } as any;
+        this.habit.checkIns[dateStr].entries = entries;
+        this.habit.checkIns[dateStr].status = entries.map(e => e.emoji);
+        this.habit.checkIns[dateStr].count = entries.length;
+        this.habit.checkIns[dateStr].timestamp = entries[entries.length - 1].timestamp || this.habit.checkIns[dateStr].timestamp;
+    }
+
+    private async getHabitPomodoroSessionsByDates(dates: string[]): Promise<Map<string, HabitDayPomodoroSessionItem[]>> {
+        try {
+            await this.pomodoroManager.initialize();
+            await this.pomodoroManager.refreshData();
+
+            const reminderData = this.plugin && typeof this.plugin.loadReminderData === "function"
+                ? ((await this.plugin.loadReminderData()) || {})
+                : {};
+            const { taskIdsByHabit } = buildLinkedHabitTaskMaps(reminderData);
+            const linkedTaskIdSet = taskIdsByHabit.get(this.habit.id) || new Set<string>();
+
+            // 一次刷新数据后读取整周，避免每天重复读取任务和番茄文件。
+            const sessionsByDate = new Map<string, HabitDayPomodoroSessionItem[]>();
+            dates.forEach(date => {
+                const sessions = this.pomodoroManager.getDateSessions(date) || [];
+                const habitSessions = sessions
+                    .filter(session => session.type === "work")
+                    .map(session => {
+                        const isHabitSession = session.eventId === this.habit.id || session.eventId.startsWith(`${this.habit.id}_`);
+                        if (isHabitSession) {
+                            return { session, source: "habit" as const };
+                        }
+                        if (isEventIdFromTaskWithInstances(session.eventId, linkedTaskIdSet)) {
+                            return { session, source: "task" as const };
+                        }
+                        return null;
+                    })
+                    .filter((item): item is HabitDayPomodoroSessionItem => !!item)
+                    .sort((a, b) => new Date(a.session.startTime).getTime() - new Date(b.session.startTime).getTime());
+                sessionsByDate.set(date, habitSessions);
+            });
+            return sessionsByDate;
+        } catch (error) {
+            console.warn("Failed to load habit pomodoro records:", error);
+            return new Map();
+        }
+    }
+
+    private formatMinutes(minutes: number): string {
+        const safe = Math.max(0, Math.round(minutes || 0));
+        const h = Math.floor(safe / 60);
+        const m = safe % 60;
+        if (h > 0) {
+            return m > 0 ? `${h}h${m}m` : `${h}h`;
+        }
+        return `${m}m`;
+    }
+
+    private formatHm(iso: string): string {
+        const d = new Date(iso);
+        const hh = String(d.getHours()).padStart(2, "0");
+        const mm = String(d.getMinutes()).padStart(2, "0");
+        return `${hh}:${mm}`;
+    }
+
+    private async render(contentContainer: HTMLElement, actionContainer?: HTMLElement) {
+        const renderVersion = ++this.renderVersion;
+        const dateStr = this.dateStr;
+        contentContainer.innerHTML = "";
+        if (!actionContainer) {
+            actionContainer = this.dialog.element.querySelector(".b3-dialog__action") as HTMLElement;
+        }
+        if (actionContainer) actionContainer.innerHTML = "";
+        const dialogTitle = this.dialog.element.querySelector(".b3-dialog__header") as HTMLElement;
+        if (dialogTitle) {
+            dialogTitle.textContent = (this.habit.icon || "") + i18n("dayDialogTitle", { title: this.habit.title, date: dateStr });
+        }
+        this.renderWeekView(contentContainer, actionContainer);
+        const weekDates = this.getWeekDates();
+
+        const header = document.createElement("div");
+        header.style.cssText = "display:flex; align-items:center; justify-content:space-between; gap:8px;";
+        const title = document.createElement("div");
+        title.innerHTML = `<span style="font-weight:600;">${i18n("dailyHabitRecordsTitle")}</span>`;
+        header.appendChild(title);
+
+        const addBtn = document.createElement("button");
+        addBtn.className = "b3-button b3-button--primary";
+        addBtn.textContent = i18n("addDayCheckIn");
+        addBtn.addEventListener("click", () => this.openAddEntryDialog());
+        header.appendChild(addBtn);
+        contentContainer.appendChild(header);
+
+        const listWrap = document.createElement("div");
+        listWrap.style.cssText = "display:flex; flex-direction:column; gap:6px; margin-top:8px;";
+        contentContainer.appendChild(listWrap);
+
+        const checkIn = this.habit.checkIns?.[this.dateStr];
+        const entries = this.getEntriesForDate(checkIn);
+
+        if (entries.length === 0) {
+            const empty = document.createElement("div");
+            empty.textContent = i18n("noDayCheckIn");
+            empty.style.cssText = "color:var(--b3-theme-on-surface-light); padding:12px;";
+            listWrap.appendChild(empty);
+        } else {
+            entries.forEach((entry, idx) => {
+                const item = document.createElement("div");
+                item.style.cssText = "display:flex; align-items:center; gap:8px; padding:8px; background:var(--b3-theme-surface); border-radius:6px;";
+
+                const emojiSpan = document.createElement("span");
+                emojiSpan.textContent = entry.emoji;
+                emojiSpan.style.cssText = "font-size:18px;";
+
+                const meaning = document.createElement("span");
+                meaning.textContent = entry.meaning ? ` ${entry.meaning}` : "";
+                meaning.style.cssText = "font-size:12px; color:var(--b3-theme-on-surface-light);";
+
+                const timeSpan = document.createElement("span");
+                timeSpan.textContent = entry.timestamp ? entry.timestamp.split(" ")[1] : "";
+                timeSpan.style.cssText = "font-size:12px; color:var(--b3-theme-on-surface-light); margin-left:8px;";
+
+                const noteSpan = document.createElement("span");
+                if (entry.note) {
+                    noteSpan.textContent = `📝 ${entry.note}`;
+                    noteSpan.style.cssText = "font-size:12px; color:var(--b3-theme-on-surface-light); margin-left:8px; max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;";
+                }
+
+                const editBtn = document.createElement("button");
+                editBtn.className = "b3-button b3-button--outline";
+                editBtn.textContent = i18n("editDayCheckIn");
+                editBtn.style.cssText = "margin-left:auto;";
+                editBtn.addEventListener("click", () => this.openEditEntryDialog(idx));
+
+                const delBtn = document.createElement("button");
+                delBtn.className = "b3-button b3-button--danger";
+                delBtn.textContent = i18n("delete");
+                delBtn.addEventListener("click", () => {
+                    confirm(
+                        i18n("confirmDeleteEntry"),
+                        i18n("confirmDeleteEntryMsg", {
+                            title: this.habit.title,
+                            date: this.dateStr,
+                            index: String(idx + 1)
+                        }),
+                        async () => {
+                            await this.deleteEntry(idx);
+                            await this.render(contentContainer, actionContainer);
+                        }
+                    );
+                });
+
+                item.appendChild(emojiSpan);
+                item.appendChild(meaning);
+                item.appendChild(timeSpan);
+                if (entry.note) item.appendChild(noteSpan);
+                item.appendChild(editBtn);
+                item.appendChild(delBtn);
+                listWrap.appendChild(item);
+            });
+        }
+
+        const sessionsByDate = await this.getHabitPomodoroSessionsByDates(weekDates);
+        if (renderVersion !== this.renderVersion) return;
+        this.renderWeekView(contentContainer, actionContainer, sessionsByDate);
+        this.renderPomodoroSection(contentContainer, sessionsByDate.get(dateStr) || []);
+
+        if (actionContainer) {
+            const closeBtn = document.createElement("button");
+            closeBtn.className = "b3-button";
+            closeBtn.textContent = i18n("close");
+            closeBtn.addEventListener("click", () => this.dialog.destroy());
+            actionContainer.appendChild(closeBtn);
+        }
+    }
+
+    private renderPomodoroSection(container: HTMLElement, sessions: HabitDayPomodoroSessionItem[]) {
+        const totalCount = sessions.reduce((sum, item) => sum + this.pomodoroManager.calculateSessionCount(item.session), 0);
+        const totalMinutes = sessions.reduce((sum, item) => sum + (item.session.duration || 0), 0);
+
+        const section = document.createElement("div");
+        section.style.cssText = "margin-top:12px; padding-top:12px; border-top:1px solid var(--b3-theme-surface-light);";
+
+        const header = document.createElement("div");
+        header.style.cssText = "display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:8px;";
+        const title = document.createElement("div");
+        title.style.cssText = "font-weight:600;";
+        title.textContent = i18n("habitDayPomodoroTitle");
+        const addBtn = document.createElement("button");
+        addBtn.className = "b3-button b3-button--outline";
+        addBtn.textContent = i18n("addPomodoro") || "补录番茄钟";
+        addBtn.addEventListener("click", () => this.openAddPomodoroDialog());
+        header.appendChild(title);
+        header.appendChild(addBtn);
+        section.appendChild(header);
+
+        const summary = document.createElement("div");
+        summary.style.cssText = "font-size:12px; color:var(--b3-theme-on-surface-light); margin-bottom:8px;";
+        summary.textContent = sessions.length > 0
+            ? i18n("dayPomodoroTotal", { count: String(totalCount), duration: String(this.formatMinutes(totalMinutes)) })
+            : i18n("noPomodoroForDay");
+        section.appendChild(summary);
+
+        if (sessions.length > 0) {
+            const list = document.createElement("div");
+            list.style.cssText = "display:flex; flex-direction:column; gap:6px;";
+            sessions.forEach(item => {
+                const session = item.session;
+                const row = document.createElement("div");
+                const count = this.pomodoroManager.calculateSessionCount(session);
+                row.style.cssText = "display:flex; align-items:center; justify-content:space-between; gap:8px; font-size:12px; padding:6px 8px; border-radius:6px; background:var(--b3-theme-background);";
+
+                const left = document.createElement("div");
+                left.style.cssText = "display:flex; flex-direction:column; gap:2px;";
+                const timeSpan = document.createElement("span");
+                timeSpan.textContent = `${this.formatHm(session.startTime)} - ${this.formatHm(session.endTime)}`;
+                const sourceSpan = document.createElement("span");
+                sourceSpan.style.cssText = "font-size:11px; color:var(--b3-theme-on-surface-light);";
+                sourceSpan.textContent = item.source === "task"
+                    ? i18n("taskBindingLabel", { title: String(session.eventTitle || i18n("unnamedTask")) })
+                    : i18n("habitNameLabel", { title: String(session.eventTitle || this.habit.title) });
+                left.appendChild(timeSpan);
+                left.appendChild(sourceSpan);
+
+                const right = document.createElement("div");
+                right.style.cssText = "display:flex; align-items:center; gap:6px;";
+
+                const value = document.createElement("span");
+                value.textContent = `🍅 ${count}（${this.formatMinutes(session.duration || 0)}）`;
+                value.style.cssText = "font-weight:600;";
+
+                const editBtn = document.createElement("button");
+                editBtn.className = "b3-button b3-button--outline";
+                editBtn.textContent = i18n("edit") || "编辑";
+                editBtn.style.cssText = "padding:2px 6px; line-height:1.2; height:24px;";
+                editBtn.addEventListener("click", () => this.openEditPomodoroDurationDialog(session));
+
+                const deleteBtn = document.createElement("button");
+                deleteBtn.className = "b3-button b3-button--outline b3-button--danger";
+                deleteBtn.textContent = i18n("delete") || "删除";
+                deleteBtn.style.cssText = "padding:2px 6px; line-height:1.2; height:24px;";
+                deleteBtn.addEventListener("click", () => this.deletePomodoroSession(session));
+
+                right.appendChild(value);
+                right.appendChild(editBtn);
+                right.appendChild(deleteBtn);
+                row.appendChild(left);
+                row.appendChild(right);
+                list.appendChild(row);
+            });
+            section.appendChild(list);
+        }
+
+        container.appendChild(section);
+    }
+
+    private async openAddPomodoroDialog() {
+        let workDuration = 25;
+        if (this.plugin && typeof this.plugin.loadSettings === "function") {
+            try {
+                const settings = await this.plugin.loadSettings();
+                workDuration = settings.pomodoroWorkDuration || 25;
+            } catch (error) {
+                console.warn("Failed to load pomodoro settings; using defaults", error);
+            }
+        }
+
+        const dialog = new Dialog({
+            title: "➕ " + (i18n("addPomodoro") || "补录番茄钟"),
+            content: `
+                <div style="padding: 16px;">
+                    <div class="b3-form__group">
+                        <label class="b3-form__label">${i18n("timeMode") || "时间模式"}</label>
+                        <select id="timeMode" class="b3-select" style="width: 100%;">
+                            <option value="end">${i18n("endTime") || "结束时间"}</option>
+                            <option value="start">${i18n("startTime") || "开始时间"}</option>
+                        </select>
+                    </div>
+                    <div class="b3-form__group">
+                        <label class="b3-form__label">${i18n("timeInputLabel") || "时间"}</label>
+                        <input type="datetime-local" id="sessionTimePoint" class="b3-text-field" style="width: 100%;" required>
+                    </div>
+                    <div class="b3-form__group">
+                        <label class="b3-form__label">${i18n("duration") || "持续时长"} (${i18n("minutes") || "分钟"})</label>
+                        <input type="number" id="sessionDuration" class="b3-text-field" value="${workDuration}" min="1" style="width: 100%;" required>
+                    </div>
+                    <div class="b3-form__group">
+                        <label class="b3-checkbox">
+                            <input type="checkbox" id="sessionIsCountUp">
+                            <span class="b3-checkbox__graphic"></span>
+                            <span class="b3-checkbox__label">${i18n("isCountUp") || "正计时 (自动计算番茄数)"}</span>
+                        </label>
+                    </div>
+                    <div class="b3-dialog__action">
+                        <button class="b3-button b3-button--cancel">${i18n("cancel")}</button>
+                        <button class="b3-button b3-button--primary" id="confirmAddPomodoro">${i18n("save")}</button>
+                    </div>
+                </div>
+            `,
+            width: "420px"
+        });
+
+        const timeInput = dialog.element.querySelector("#sessionTimePoint") as HTMLInputElement;
+        const baseDate = new Date(`${this.dateStr}T12:00:00`);
+        timeInput.value = `${baseDate.getFullYear()}-${String(baseDate.getMonth() + 1).padStart(2, "0")}-${String(baseDate.getDate()).padStart(2, "0")}T12:00`;
+
+        dialog.element.querySelector(".b3-button--cancel")?.addEventListener("click", () => dialog.destroy());
+
+        dialog.element.querySelector("#confirmAddPomodoro")?.addEventListener("click", async () => {
+            const timeMode = (dialog.element.querySelector("#timeMode") as HTMLSelectElement).value;
+            const timePointStr = (dialog.element.querySelector("#sessionTimePoint") as HTMLInputElement).value;
+            const duration = parseInt((dialog.element.querySelector("#sessionDuration") as HTMLInputElement).value, 10);
+            const isCountUp = (dialog.element.querySelector("#sessionIsCountUp") as HTMLInputElement).checked;
+
+            if (!timePointStr || !duration || duration <= 0) {
+                showMessage(i18n("pleaseEnterValidInfo") || "请输入有效信息", 3000, "error");
+                return;
+            }
+
+            try {
+                await this.pomodoroManager.initialize();
+                const timePoint = new Date(timePointStr);
+                let startTime: Date;
+                let endTime: Date;
+                if (timeMode === "end") {
+                    endTime = timePoint;
+                    startTime = new Date(endTime.getTime() - duration * 60000);
+                } else {
+                    startTime = timePoint;
+                    endTime = new Date(startTime.getTime() + duration * 60000);
+                }
+
+                const plannedDuration = isCountUp ? workDuration : duration;
+                const count = Math.max(1, Math.round(duration / Math.max(1, plannedDuration)));
+                const session: PomodoroSession = {
+                    id: Date.now().toString(36) + Math.random().toString(36).slice(2),
+                    type: "work",
+                    eventId: this.habit.id,
+                    eventTitle: this.habit.title,
+                    startTime: startTime.toISOString(),
+                    endTime: endTime.toISOString(),
+                    duration,
+                    plannedDuration,
+                    completed: true,
+                    isCountUp,
+                    count
+                };
+
+                const logicalDate = getLogicalDateString(startTime);
+                const records = (this.pomodoroManager as any).records;
+                if (!records[logicalDate]) {
+                    records[logicalDate] = {
+                        date: logicalDate,
+                        workSessions: 0,
+                        totalWorkTime: 0,
+                        totalBreakTime: 0,
+                        sessions: []
+                    };
+                }
+                records[logicalDate].sessions.push(session);
+                records[logicalDate].workSessions += this.pomodoroManager.calculateSessionCount(session);
+                records[logicalDate].totalWorkTime += duration;
+                await (this.pomodoroManager as any).saveRecords([logicalDate]);
+                this.pomodoroManager.refreshIndex();
+
+                let autoCheckInApplied = false;
+                if (session.type === "work") {
+                    // 每次补录后只做“达标即补1次自动打卡”，避免一次补录写入多个✅
+                    autoCheckInApplied = await this.applyAutoCheckInFromPomodoro(logicalDate, 1);
+                }
+
+                showMessage("✅ " + (i18n("addPomodoroSuccess") || "补录番茄钟成功"), 3000, "info");
+                dialog.destroy();
+
+                if (!autoCheckInApplied) {
+                    try {
+                        await this.onSave(this.habit);
+                    } catch (error) {
+                        console.warn("Failed to refresh habit view:", error);
+                    }
+                }
+                const content = this.dialog.element.querySelector(".b3-dialog__content") as HTMLElement;
+                const action = this.dialog.element.querySelector(".b3-dialog__action") as HTMLElement;
+                if (content) await this.render(content, action);
+                window.dispatchEvent(new CustomEvent("habitUpdated"));
+                window.dispatchEvent(new CustomEvent("reminderUpdated"));
+            } catch (error) {
+                console.error("Failed to add past pomodoro record:", error);
+                showMessage("❌ " + (i18n("addPomodoroFailed") || "补录番茄钟失败"), 3000, "error");
+            }
+        });
+    }
+
+    private async applyAutoCheckInFromPomodoro(dateStr: string, _count: number): Promise<boolean> {
+        if (!this.habit.autoCheckInAfterPomodoro) return false;
+
+        const now = getLocalDateTimeString(new Date());
+        const selectedEmoji = this.habit.autoCheckInEmoji || this.habit.checkInEmojis?.[0]?.emoji || "✅";
+
+        let emojiConfig = this.habit.checkInEmojis?.find(item => item.emoji === selectedEmoji);
+        if (!emojiConfig) {
+            emojiConfig = {
+                emoji: selectedEmoji,
+                meaning: POMODORO_PER_SESSION_AUTO_CHECKIN_MEANING,
+                countsAsSuccess: true,
+                promptNote: false
+            };
+            this.habit.checkInEmojis = [...(this.habit.checkInEmojis || []), emojiConfig];
+        }
+
+        this.habit.checkIns = this.habit.checkIns || {};
+        if (!this.habit.checkIns[dateStr]) {
+            this.habit.checkIns[dateStr] = {
+                count: 0,
+                status: [],
+                timestamp: now,
+                entries: []
+            } as any;
+        }
+
+        const dayCheckIn = this.habit.checkIns[dateStr];
+        dayCheckIn.entries = dayCheckIn.entries || [];
+        dayCheckIn.status = dayCheckIn.status || [];
+
+        const existingSuccess = this.getEntriesForDate(dayCheckIn).filter(entry => {
+            const cfg = this.habit.checkInEmojis?.find(item => item.emoji === entry.emoji);
+            return cfg ? cfg.countsAsSuccess !== false : true;
+        }).length;
+        if (existingSuccess > 0) {
+            return false;
+        }
+
+        const entry: HabitMemoCheckInEntry = {
+            emoji: emojiConfig.emoji, 
+            timestamp: now,
+            meaning: POMODORO_PER_SESSION_AUTO_CHECKIN_MEANING,
+            group: (emojiConfig.group || '').trim() || undefined
+        };
+        await syncHabitMemoBlock({
+            habit: this.habit,
+            entry,
+            emojiConfig: emojiConfig as HabitMemoEmojiConfig
+        });
+        dayCheckIn.entries.push(entry);
+        dayCheckIn.status.push(emojiConfig.emoji);
+        dayCheckIn.count = (dayCheckIn.count || 0) + 1;
+        dayCheckIn.timestamp = now;
+
+        this.habit.totalCheckIns = (this.habit.totalCheckIns || 0) + 1;
+        this.habit.updatedAt = now;
+
+        try {
+            await this.onSave(this.habit);
+            if (this.plugin?.playTaskCompleteSound) {
+                this.plugin.playTaskCompleteSound();
+            }
+            return true;
+        } catch (error) {
+            console.warn("Failed to save automatic pomodoro check-in:", error);
+            return false;
+        }
+    }
+
+    private openEditPomodoroDurationDialog(session: PomodoroSession) {
+        const dialog = new Dialog({
+            title: "✏️ " + (i18n("editPomodoro") || "编辑番茄钟"),
+            content: `
+                <div style="padding:16px;">
+                    <div class="b3-form__group">
+                        <label class="b3-form__label">${i18n("duration") || "持续时长"} (${i18n("minutes") || "分钟"})</label>
+                        <input type="number" id="editPomodoroDuration" class="b3-text-field" min="1" value="${Math.max(1, Math.round(session.duration || 1))}" style="width:100%;" />
+                    </div>
+                    <div class="b3-dialog__action">
+                        <button class="b3-button b3-button--cancel">${i18n("cancel") || "取消"}</button>
+                        <button class="b3-button b3-button--primary" id="confirmEditPomodoro">${i18n("save") || "保存"}</button>
+                    </div>
+                </div>
+            `,
+            width: "360px"
+        });
+
+        dialog.element.querySelector(".b3-button--cancel")?.addEventListener("click", () => dialog.destroy());
+        dialog.element.querySelector("#confirmEditPomodoro")?.addEventListener("click", async () => {
+            const durationInput = dialog.element.querySelector("#editPomodoroDuration") as HTMLInputElement;
+            const newDuration = parseInt(durationInput.value, 10);
+            if (!newDuration || newDuration <= 0) {
+                showMessage(i18n("pleaseEnterValidInfo") || "请输入有效信息", 3000, "error");
+                return;
+            }
+
+            try {
+                await this.pomodoroManager.initialize();
+                const records = (this.pomodoroManager as any).records || {};
+                let affectedDate = "";
+                Object.keys(records).forEach(date => {
+                    const record = records[date];
+                    if (!record?.sessions) return;
+                    const sessionIndex = record.sessions.findIndex((s: PomodoroSession) => s.id === session.id);
+                    if (sessionIndex === -1 || affectedDate) return;
+
+                    affectedDate = date;
+                    const target = record.sessions[sessionIndex];
+
+                    // 1. 还原旧统计
+                    const oldCount = this.pomodoroManager.calculateSessionCount(target);
+                    if (target.type === 'work') {
+                        record.workSessions = Math.max(0, record.workSessions - oldCount);
+                        record.totalWorkTime = Math.max(0, record.totalWorkTime - (target.duration || 0));
+                    } else {
+                        record.totalBreakTime = Math.max(0, record.totalBreakTime - (target.duration || 0));
+                    }
+
+                    // 2. 更新数据
+                    target.duration = newDuration;
+                    const start = new Date(target.startTime);
+                    target.endTime = new Date(start.getTime() + newDuration * 60000).toISOString();
+                    if (target.isCountUp) {
+                        target.count = Math.max(1, Math.round(newDuration / Math.max(1, target.plannedDuration || 25)));
+                    } else if (typeof target.count === "number") {
+                        target.count = Math.max(1, target.count);
+                    }
+
+                    // 3. 应用新统计
+                    const newCount = this.pomodoroManager.calculateSessionCount(target);
+                    if (target.type === 'work') {
+                        record.workSessions += newCount;
+                        record.totalWorkTime += newDuration;
+                    } else {
+                        record.totalBreakTime += newDuration;
+                    }
+                });
+
+                if (!affectedDate) {
+                    showMessage(i18n("pomodoroRecordMissingMessage"), 3000, "error");
+                    return;
+                }
+
+                await (this.pomodoroManager as any).saveRecords([affectedDate]);
+                this.pomodoroManager.refreshIndex();
+                showMessage("✅ " + (i18n("habitSaveSuccess") || "保存成功"), 2000);
+                dialog.destroy();
+
+                try {
+                    await this.onSave(this.habit);
+                } catch (error) {
+                    console.warn("Failed to refresh habit view:", error);
+                }
+                const content = this.dialog.element.querySelector(".b3-dialog__content") as HTMLElement;
+                const action = this.dialog.element.querySelector(".b3-dialog__action") as HTMLElement;
+                if (content) await this.render(content, action);
+                window.dispatchEvent(new CustomEvent("habitUpdated"));
+                window.dispatchEvent(new CustomEvent("reminderUpdated"));
+            } catch (error) {
+                console.error("Failed to modify pomodoro duration:", error);
+                showMessage(i18n("updatePomodoroDurationFailed"), 3000, "error");
+            }
+        });
+    }
+
+    private async deletePomodoroSession(session: PomodoroSession) {
+        confirm(
+            i18n("delete") || "删除",
+            i18n("deletePomodoroRecordConfirm"),
+            async () => {
+                try {
+                    await this.pomodoroManager.initialize();
+                    const success = await this.pomodoroManager.deleteSession(session.id);
+                    if (!success) {
+                        showMessage(i18n("pomodoroRecordMissingMessage"), 3000, "error");
+                        return;
+                    }
+                    this.pomodoroManager.refreshIndex();
+                    showMessage(i18n("deleteSuccessMessage"), 2000);
+
+                    try {
+                        await this.onSave(this.habit);
+                    } catch (error) {
+                        console.warn("Failed to refresh habit view:", error);
+                    }
+                    const content = this.dialog.element.querySelector(".b3-dialog__content") as HTMLElement;
+                    const action = this.dialog.element.querySelector(".b3-dialog__action") as HTMLElement;
+                    if (content) await this.render(content, action);
+                    window.dispatchEvent(new CustomEvent("habitUpdated"));
+                    window.dispatchEvent(new CustomEvent("reminderUpdated"));
+                } catch (error) {
+                    console.error("Failed to delete pomodoro record:", error);
+                    showMessage(i18n("deletePomodoroRecordFailed"), 3000, "error");
+                }
+            }
+        );
+    }
+
+    /** 可独立打开，也可从每日记录弹窗中打开。 */
+    public openAddEntryDialog() {
+        const today = getLogicalDateString();
+        const dialog = new Dialog({
+            title: i18n("addDayCheckIn"),
+            content: "<div id=\"habitDayAddEntry\"></div>",
+            width: "420px",
+            height: "400px"
+        });
+        const container = dialog.element.querySelector("#habitDayAddEntry") as HTMLElement;
+        if (!container) return;
+        container.style.cssText = "display: flex; flex-direction: column; height: 100%;";
+
+        const contentDiv = document.createElement("div");
+        contentDiv.className = "b3-dialog__content";
+        contentDiv.style.cssText = "flex: 1; padding: 16px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px;";
+        container.appendChild(contentDiv);
+
+        const actionDiv = document.createElement("div");
+        actionDiv.className = "b3-dialog__action";
+        actionDiv.style.cssText = "padding: 12px 16px; display: flex; justify-content: flex-end; gap: 8px; border-top: 1px solid var(--b3-border-color);";
+        container.appendChild(actionDiv);
+
+        const timeRow = document.createElement("div");
+        timeRow.style.cssText = "display:flex; gap:8px; align-items:center;";
+        const timeLabel = document.createElement("label");
+        timeLabel.textContent = i18n("timeInputLabel");
+        const timeInput = document.createElement("input");
+        timeInput.type = "time";
+        const now = new Date();
+        const hh = String(now.getHours()).padStart(2, "0");
+        const mm = String(now.getMinutes()).padStart(2, "0");
+        timeInput.value = `${hh}:${mm}`;
+        timeInput.style.cssText = "flex:1;";
+        timeRow.appendChild(timeLabel);
+        timeRow.appendChild(timeInput);
+        contentDiv.appendChild(timeRow);
+
+        const statusRow = document.createElement("div");
+        statusRow.style.cssText = "display:flex; align-items:center; justify-content:space-between; gap:8px;";
+        const emojiLabel = document.createElement("div");
+        emojiLabel.textContent = i18n("checkInStatusLabel");
+        emojiLabel.style.cssText = "font-weight:bold;";
+        statusRow.appendChild(emojiLabel);
+
+        const multiSelectLabel = document.createElement("label");
+        multiSelectLabel.style.cssText = "display:flex; align-items:center; gap:8px; cursor:pointer;";
+        const multiSelectText = document.createElement("span");
+        multiSelectText.textContent = i18n("multiSelect");
+        const multiSelectSwitch = document.createElement("input");
+        multiSelectSwitch.type = "checkbox";
+        multiSelectSwitch.className = "b3-switch";
+        multiSelectLabel.appendChild(multiSelectText);
+        multiSelectLabel.appendChild(multiSelectSwitch);
+        statusRow.appendChild(multiSelectLabel);
+        contentDiv.appendChild(statusRow);
+
+        const wrap = document.createElement("div");
+        wrap.style.cssText = "display:flex; flex-wrap:wrap; gap:8px;";
+        const emojiConfigs = this.getAvailableCheckInEmojisForDate(this.dateStr);
+        // 按配置对象选择，避免不同分组中相同表情的状态互相覆盖。
+        const selectedConfigs = new Set<HabitCheckInEmoji>(emojiConfigs.slice(0, 1));
+        const optionButtons = new Map<HabitCheckInEmoji, HTMLButtonElement>();
+        const updateSelection = () => {
+            optionButtons.forEach((button, config) => {
+                const selected = selectedConfigs.has(config);
+                button.className = `b3-button ${selected ? "b3-button--primary" : "b3-button--outline"}`;
+                button.setAttribute("aria-pressed", String(selected));
+            });
+            saveBtn.disabled = selectedConfigs.size === 0;
+        };
+        multiSelectSwitch.addEventListener("change", () => {
+            if (!multiSelectSwitch.checked && selectedConfigs.size > 1) {
+                const firstSelected = emojiConfigs.find(config => selectedConfigs.has(config));
+                selectedConfigs.clear();
+                if (firstSelected) selectedConfigs.add(firstSelected);
+            }
+            updateSelection();
+        });
+        if (emojiConfigs.length === 0) {
+            const empty = document.createElement("div");
+            empty.textContent = i18n("noHabitCheckInOptions");
+            empty.style.cssText = "color:var(--b3-theme-on-surface-light); font-size:12px;";
+            wrap.appendChild(empty);
+        }
+        emojiConfigs.forEach(cfg => {
+            const btn = document.createElement("button");
+            btn.innerHTML = `<span style="font-size:18px;">${cfg.emoji}</span><span style="font-size:12px; color:var(--b3-theme-on-surface-light); margin-left:6px;">${cfg.meaning || ""}</span>`;
+            btn.addEventListener("click", () => {
+                if (multiSelectSwitch.checked) {
+                    if (selectedConfigs.has(cfg)) {
+                        selectedConfigs.delete(cfg);
+                    } else {
+                        selectedConfigs.add(cfg);
+                    }
+                } else {
+                    selectedConfigs.clear();
+                    selectedConfigs.add(cfg);
+                }
+                updateSelection();
+            });
+            optionButtons.set(cfg, btn);
+            wrap.appendChild(btn);
+        });
+        contentDiv.appendChild(wrap);
+
+        const noteLabel = document.createElement("div");
+        noteLabel.textContent = i18n("noteOptionalLabel");
+        contentDiv.appendChild(noteLabel);
+        const noteInput = document.createElement("textarea");
+        noteInput.style.cssText = "width:100%; height:80px; box-sizing: border-box; padding: 8px; resize: vertical;";
+        contentDiv.appendChild(noteInput);
+
+        if (today !== this.dateStr) {
+            const tip = document.createElement("div");
+            tip.textContent = i18n("retroactiveCheckInTip");
+            tip.style.cssText = "color: var(--b3-theme-on-surface-light); font-size: 12px;";
+            contentDiv.appendChild(tip);
+        }
+
+
+        const cancelBtn = document.createElement("button");
+        cancelBtn.className = "b3-button";
+        cancelBtn.textContent = i18n("cancel");
+        cancelBtn.addEventListener("click", () => dialog.destroy());
+        const saveBtn = document.createElement("button");
+        saveBtn.className = "b3-button b3-button--primary";
+        saveBtn.textContent = i18n("save");
+        updateSelection();
+        let saving = false;
+        saveBtn.addEventListener("click", async () => {
+            if (saving || selectedConfigs.size === 0) return;
+            saving = true;
+            saveBtn.disabled = true;
+            cancelBtn.disabled = true;
+            multiSelectSwitch.disabled = true;
+            optionButtons.forEach(button => button.disabled = true);
+            try {
+                const timestamp = `${this.dateStr} ${timeInput.value || `${hh}:${mm}`}`;
+                const note = noteInput.value.trim() || undefined;
+                const configsToSave = emojiConfigs.filter(config => selectedConfigs.has(config));
+                const newEntries: HabitDayEntry[] = [];
+                // 逐项同步备注块，保留每个状态自己的分组和同步目标。
+                for (const emojiConfig of configsToSave) {
+                    const entry: HabitDayEntry = {
+                        emoji: emojiConfig.emoji,
+                        meaning: emojiConfig.meaning || this.getMeaningForEmoji(emojiConfig.emoji),
+                        timestamp,
+                        note,
+                        group: (emojiConfig.group || '').trim() || undefined
+                    };
+                    await syncHabitMemoBlock({
+                        habit: this.habit,
+                        entry: entry as HabitMemoCheckInEntry,
+                        emojiConfig: emojiConfig as HabitMemoEmojiConfig
+                    });
+                    newEntries.push(entry);
+                }
+                const entries = this.getEntriesForDate(this.habit.checkIns?.[this.dateStr]);
+                await this.setEntriesForDate(this.dateStr, [...entries, ...newEntries]);
+                this.habit.totalCheckIns = (this.habit.totalCheckIns || 0) + newEntries.length;
+                this.habit.updatedAt = getLocalDateTimeString(new Date());
+                await this.onSave(this.habit);
+                if (this.plugin?.playTaskCompleteSound) {
+                    this.plugin.playTaskCompleteSound();
+                }
+                showMessage(i18n("retroactiveSuccess"));
+                dialog.destroy();
+                const content = this.dialog?.element.querySelector(".b3-dialog__content") as HTMLElement;
+                const action = this.dialog?.element.querySelector(".b3-dialog__action") as HTMLElement;
+                if (content) await this.render(content, action);
+            } catch (error) {
+                console.error("Failed to save habit check-in:", error);
+                showMessage(i18n("habitSaveFailed"), 3000, "error");
+            } finally {
+                saving = false;
+                cancelBtn.disabled = false;
+                multiSelectSwitch.disabled = false;
+                optionButtons.forEach(button => button.disabled = false);
+                updateSelection();
+            }
+        });
+        actionDiv.appendChild(cancelBtn);
+        actionDiv.appendChild(saveBtn);
+
+
+    }
+
+    private async openEditEntryDialog(index: number) {
+        const checkIn = this.habit.checkIns?.[this.dateStr];
+        const entries = this.getEntriesForDate(checkIn);
+        const entry = entries[index];
+        if (!entry) return;
+
+        const dialog = new Dialog({
+            title: i18n("editDayCheckIn"),
+            content: "<div id=\"habitDayEditEntry\"></div>",
+            width: "380px",
+            height: "360px"
+        });
+        const container = dialog.element.querySelector("#habitDayEditEntry") as HTMLElement;
+        if (!container) return;
+        container.style.cssText = "display: flex; flex-direction: column; height: 100%;";
+
+        const contentDiv = document.createElement("div");
+        contentDiv.className = "b3-dialog__content";
+        contentDiv.style.cssText = "flex: 1; padding: 16px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px;";
+        container.appendChild(contentDiv);
+
+        const actionDiv = document.createElement("div");
+        actionDiv.className = "b3-dialog__action";
+        actionDiv.style.cssText = "padding: 12px 16px; display: flex; justify-content: flex-end; gap: 8px; border-top: 1px solid var(--b3-border-color);";
+        container.appendChild(actionDiv);
+
+        const timeRow = document.createElement("div");
+        timeRow.style.cssText = "display:flex; gap:8px; align-items:center;";
+        const timeLabel = document.createElement("label");
+        timeLabel.textContent = i18n("timeInputLabel");
+        const timeInput = document.createElement("input");
+        timeInput.type = "time";
+        timeInput.value = entry.timestamp ? entry.timestamp.split(" ")[1] : "";
+        timeInput.style.cssText = "flex:1;";
+        timeRow.appendChild(timeLabel);
+        timeRow.appendChild(timeInput);
+        contentDiv.appendChild(timeRow);
+
+        const noteLabel = document.createElement("div");
+        noteLabel.textContent = i18n("noteOptionalLabel");
+        contentDiv.appendChild(noteLabel);
+        const noteInput = document.createElement("textarea");
+        noteInput.style.cssText = "width:100%; height:80px; box-sizing: border-box; padding: 8px; resize: vertical;";
+        noteInput.value = entry.note || "";
+        contentDiv.appendChild(noteInput);
+
+
+        const cancelBtn = document.createElement("button");
+        cancelBtn.className = "b3-button";
+        cancelBtn.textContent = i18n("cancel");
+        cancelBtn.addEventListener("click", () => dialog.destroy());
+        const saveBtn = document.createElement("button");
+        saveBtn.className = "b3-button b3-button--primary";
+        saveBtn.textContent = i18n("save");
+        saveBtn.addEventListener("click", async () => {
+            const newTime = timeInput.value || (entry.timestamp ? entry.timestamp.split(" ")[1] : "");
+            const previousEntry = { ...entries[index] } as HabitMemoCheckInEntry;
+            entries[index].timestamp = `${this.dateStr} ${newTime}`;
+            entries[index].note = noteInput.value.trim() || undefined;
+            const emojiConfig = this.habit.checkInEmojis?.find(item => item.emoji === entries[index].emoji && (!entries[index].meaning || item.meaning === entries[index].meaning))
+                || this.habit.checkInEmojis?.find(item => item.emoji === entries[index].emoji);
+            await syncHabitMemoBlock({
+                habit: this.habit,
+                entry: entries[index] as HabitMemoCheckInEntry,
+                emojiConfig: emojiConfig as HabitMemoEmojiConfig | undefined,
+                previousEntry
+            });
+            await this.setEntriesForDate(this.dateStr, entries);
+            this.habit.updatedAt = getLocalDateTimeString(new Date());
+            await this.onSave(this.habit);
+            showMessage(i18n("habitSaveSuccess"));
+            dialog.destroy();
+            const content = this.dialog.element.querySelector(".b3-dialog__content") as HTMLElement;
+            const action = this.dialog.element.querySelector(".b3-dialog__action") as HTMLElement;
+            if (content) await this.render(content, action);
+        });
+        actionDiv.appendChild(cancelBtn);
+        actionDiv.appendChild(saveBtn);
+    }
+
+    private async deleteEntry(index: number) {
+        const checkIn = this.habit.checkIns?.[this.dateStr];
+        const entries = this.getEntriesForDate(checkIn);
+        if (index < 0 || index >= entries.length) return;
+        await deleteHabitMemoBlockForEntry(entries[index] as HabitMemoCheckInEntry);
+        entries.splice(index, 1);
+        await this.setEntriesForDate(this.dateStr, entries);
+        this.habit.totalCheckIns = Math.max(0, (this.habit.totalCheckIns || 0) - 1);
+        this.habit.updatedAt = getLocalDateTimeString(new Date());
+        await this.onSave(this.habit);
+    }
+}

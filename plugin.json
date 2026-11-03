@@ -2,32 +2,16 @@
   "name": "siyuan-plugin-task-note-management",
   "author": "Achuan-2",
   "url": "https://github.com/Achuan-2/siyuan-plugin-task-note-management",
-  "version": "7.0.4",
+  "version": "7.1.8",
   "minAppVersion": "3.7.0",
   "kernels": [
-    "windows",
-    "linux",
-    "darwin",
-    "docker",
-    "ios",
-    "android",
-    "harmony"
+    "all"
   ],
   "backends": [
-    "windows",
-    "linux",
-    "darwin",
-    "docker",
-    "ios",
-    "android",
-    "harmony"
+    "all"
   ],
   "frontends": [
-    "desktop",
-    "mobile",
-    "browser-desktop",
-    "browser-mobile",
-    "desktop-window"
+    "all"
   ],
   "disabledInPublish": true,
   "displayName": {
@@ -44,7 +28,8 @@
   },
   "funding": {
     "custom": [
-      "https://fastly.jsdelivr.net/gh/Achuan-2/PicBed/assets/20241128221208-2024-11-28.png"
+        "https://pancake.waffo.ai/store/achuan-2-fdbho4ye/product/PROD_3F7Aa7c2NQlz9KmxcgxjQ7?type=onetime&currency=USD",
+        "https://fastly.jsdelivr.net/gh/Achuan-2/PicBed/assets/20241128221208-2024-11-28.png"
     ]
   },
   "keywords": [

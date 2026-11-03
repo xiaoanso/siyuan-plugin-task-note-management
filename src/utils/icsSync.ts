@@ -1,5 +1,5 @@
 import { getFileStat } from "../api";
-import { uploadIcsToCloud } from "./icsUtils";
+import { uploadIcsToCloud } from "./icsExport";
 
 type IcsSyncInterval = "manual" | "15min" | "hourly" | "4hour" | "12hour" | "daily" | "dailyAt";
 
@@ -13,6 +13,7 @@ interface IcsSyncState {
     timer: number | null;
     subscriptionTimer: number | null;
     isPerforming: boolean;
+    lastCheckedAt: number;
 }
 
 const ICS_SYNC_STATE = new WeakMap<object, IcsSyncState>();
@@ -20,7 +21,7 @@ const ICS_SYNC_STATE = new WeakMap<object, IcsSyncState>();
 function getState(plugin: IcsSyncPlugin): IcsSyncState {
     let state = ICS_SYNC_STATE.get(plugin as unknown as object);
     if (!state) {
-        state = { timer: null, subscriptionTimer: null, isPerforming: false };
+        state = { timer: null, subscriptionTimer: null, isPerforming: false, lastCheckedAt: 0 };
         ICS_SYNC_STATE.set(plugin as unknown as object, state);
     }
     return state;
@@ -69,7 +70,7 @@ export async function initIcsSubscriptionSync(plugin: IcsSyncPlugin): Promise<vo
         // 启动定时检查 (参考 ICS 云端同步的短轮询机制)
         await scheduleIcsSubscriptionSync(plugin);
     } catch (error) {
-        console.error("初始化ICS订阅同步失败:", error);
+        console.error("Failed to initialize ICS subscription sync:", error);
     }
 }
 
@@ -83,7 +84,7 @@ async function scheduleIcsSubscriptionSync(plugin: IcsSyncPlugin): Promise<void>
         try {
             await performIcsSubscriptionSync(plugin);
         } catch (error) {
-            console.error("ICS订阅轮询同步检查失败:", error);
+            console.error("ICS subscription polling sync check failed:", error);
         }
     }, shortPollMs);
 }
@@ -196,13 +197,10 @@ async function scheduleIcsSync(plugin: IcsSyncPlugin, interval: IcsSyncInterval,
             return target.getTime();
         }
 
-        // 其他模式：基于上次同步时间 + 间隔
-        if (settings && settings.icsLastSyncAt) {
-            const last = Date.parse(settings.icsLastSyncAt);
-            if (!isNaN(last)) {
-                return last + intervalMs;
-            }
-        }
+        // 未上传的检查时间只留在内存，仍需按间隔安排下一次检查。
+        const last = Math.max(settings?.icsLastSyncAt ? Date.parse(settings.icsLastSyncAt) || 0 : 0,
+            state.lastCheckedAt);
+        if (last > 0) return last + intervalMs;
         return Date.now() + intervalMs;
     };
 
@@ -253,7 +251,7 @@ async function scheduleIcsSync(plugin: IcsSyncPlugin, interval: IcsSyncInterval,
             }
         }
     } catch (e) {
-        console.warn("计算 ICS 下次同步时间失败，使用默认策略:", e);
+        console.warn("Failed to calculate next ICS sync time; using default strategy:", e);
         nextDueMs = Date.now() + intervalMs;
     }
 
@@ -276,7 +274,7 @@ async function scheduleIcsSync(plugin: IcsSyncPlugin, interval: IcsSyncInterval,
             // 同步成功后，重新计算下一次触发时间
             nextDueMs = await calculateNextDueMs();
         } catch (e) {
-            console.warn("短轮询触发 ICS 同步失败:", e);
+            console.warn("ICS sync triggered by short polling failed:", e);
         }
     }, shortPollMs);
 }
@@ -294,15 +292,14 @@ async function performIcsSync(plugin: IcsSyncPlugin): Promise<void> {
         const stat = await getFileStat(reminderPath);
         const lastSync = settings.icsLastSyncAt ? new Date(settings.icsLastSyncAt).getTime() : 0;
         if (stat && stat.mtime <= lastSync) {
-            // 没有新事件，只更新同步时间
-            settings.icsLastSyncAt = new Date().toISOString();
-            await plugin.saveSettings(settings);
+            // 没有新事件时不回写设置，避免定时检查触发思源同步。
+            state.lastCheckedAt = Date.now();
             return;
         }
 
         await uploadIcsToCloud(plugin as any, settings, settings.icsSilentUpload);
     } catch (error) {
-        console.error("ICS自动同步失败:", error);
+        console.error("Automatic ICS sync failed:", error);
     } finally {
         state.isPerforming = false;
     }

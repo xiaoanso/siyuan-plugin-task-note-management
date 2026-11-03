@@ -1,7 +1,8 @@
 import { Dialog, showMessage, openEmoji } from "siyuan";
+import { getDragHandleIcon } from "../../utils/dragHandleIcon";
 import { i18n } from "../../pluginInstance";
 import { generateRandomColor } from "../../utils/uiUtils";
-import { BlockBindingDialog } from "../BlockBindingDialog";
+import { BlockBindingDialog } from "./BlockBindingDialog";
 import { saveReminders } from "../../utils/icsSubscription";
 
 export async function showManageGroupsDialog(view: any) {
@@ -128,7 +129,7 @@ export async function showManageGroupsDialog(view: any) {
         try {
             await createGroupDialog(view, groupsContainer);
         } catch (err) {
-            console.error(i18n('openCreateGroupFailed'), err);
+            console.error("Failed to open create group dialog", err);
             showMessage(i18n('openCreateGroupFailed'));
         }
     });
@@ -151,7 +152,7 @@ export async function showManageGroupsDialog(view: any) {
 
         try {
             // 获取当前项目的分组列表
-            const { ProjectManager } = await import('../../utils/projectManager');
+            const { ProjectManager } = await import('../dataManager/projectManager');
             const projectManager = ProjectManager.getInstance(view.plugin);
             const currentGroups = await projectManager.getProjectCustomGroups(view.projectId);
 
@@ -189,7 +190,7 @@ export async function showManageGroupsDialog(view: any) {
             await view.loadProject();
             view.queueLoadTasks();
         } catch (error) {
-            console.error(i18n('saveGroupFailed'), error);
+            console.error("Save group failed", error);
             showMessage(i18n('saveGroupFailed'));
         }
     });
@@ -352,7 +353,7 @@ export async function createGroupDialog(view: any, container: HTMLElement) {
             showMessage(i18n('groupCreated'));
             dialog.destroy();
         } catch (error) {
-            console.error(i18n('createGroupFailed'), error);
+            console.error("Failed to create group", error);
             showMessage(i18n('createGroupFailed'));
         }
     });
@@ -414,12 +415,15 @@ export async function loadAndDisplayGroups(view: any, container: HTMLElement) {
 
             const dragHandle = document.createElement('span');
             dragHandle.className = 'group-drag-handle';
-            dragHandle.innerHTML = '⋮⋮';
+            dragHandle.innerHTML = getDragHandleIcon();
             dragHandle.style.cssText = `
-                font-size: 14px;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                flex-shrink: 0;
                 color: var(--b3-theme-on-surface);
                 opacity: 0.6;
-                cursor: move;
+                cursor: grab;
                 padding: 4px 6px;
                 margin-right: 8px;
                 border-radius: 4px;
@@ -483,7 +487,7 @@ export async function loadAndDisplayGroups(view: any, container: HTMLElement) {
                 groupName.dataset.type = 'a';
                 groupName.dataset.href = `siyuan://blocks/${group.blockId}`;
                 groupName.classList.add('ariaLabel');
-                groupName.setAttribute('aria-label', `${group.name} (点击打开绑定块)`);
+                groupName.setAttribute('aria-label', i18n("groupOpenBoundBlock", { name: String(group.name) }));
             } else {
                 groupName.classList.add('ariaLabel');
                 groupName.setAttribute('aria-label', group.name);
@@ -558,7 +562,7 @@ export async function loadAndDisplayGroups(view: any, container: HTMLElement) {
                         view.dispatchReminderUpdate();
                     }
                 } catch (error) {
-                    console.error(i18n('archiveUnarchiveGroupFailed'), error);
+                    console.error("Archive/Unarchive group failed", error);
                     showMessage(i18n('archiveUnarchiveGroupFailed'));
                 }
             });
@@ -631,7 +635,7 @@ export async function loadAndDisplayGroups(view: any, container: HTMLElement) {
             addGroupDragAndDrop(view, groupItem, group, container);
         });
     } catch (error) {
-        console.error(i18n('loadGroupsFailed'), error);
+        console.error("Load groups failed", error);
         container.innerHTML = `<div style="text-align: center; color: var(--b3-theme-error); padding: 20px;">${i18n('loadGroupsFailed')}</div>`;
     }
 }
@@ -821,7 +825,7 @@ export async function editGroup(view: any, group: any, _groupItem: HTMLElement, 
                 view.dispatchReminderUpdate(true);
             }
         } catch (error) {
-            console.error(i18n('saveGroupFailed'), error);
+            console.error("Save group failed", error);
             showMessage(i18n('saveGroupFailed'));
         }
     });
@@ -963,7 +967,7 @@ export async function deleteGroup(view: any, groupId: string, _groupItem: HTMLEl
 
             dialog.destroy();
         } catch (error) {
-            console.error(i18n('deleteGroupFailed'), error);
+            console.error("Delete group failed", error);
             showMessage(i18n('deleteGroupFailed'));
             dialog.destroy();
         }
@@ -1168,7 +1172,7 @@ export function addGroupDragAndDrop(view: any, groupItem: HTMLElement, group: an
         if (!draggedId || draggedId === group.id) return;
 
         try {
-            const { ProjectManager } = await import('../../utils/projectManager');
+            const { ProjectManager } = await import('../dataManager/projectManager');
             const projectManager = ProjectManager.getInstance(view.plugin);
             const currentGroups = await projectManager.getProjectCustomGroups(view.projectId);
 
@@ -1207,10 +1211,10 @@ export function addGroupDragAndDrop(view: any, groupItem: HTMLElement, group: an
 
             await loadAndDisplayGroups(view, container);
             view.queueLoadTasks();
-            showMessage('分组顺序已更新');
+            showMessage(i18n("groupOrderUpdated"));
         } catch (error) {
-            console.error('更新分组顺序失败:', error);
-            showMessage('更新分组顺序失败');
+            console.error("Failed to update group order:", error);
+            showMessage(i18n("groupOrderUpdateFailed"));
         }
     });
 }

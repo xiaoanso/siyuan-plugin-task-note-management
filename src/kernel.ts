@@ -1,17 +1,18 @@
 /// <reference types="siyuan/kernel" />
 
-import type { IMcp, ILogger, IStorage, IRpc } from "siyuan/kernel";
+import type { ILogger, ISiyuan } from "siyuan/kernel";
 import { createKernelStorage, type KernelStorage } from "./kernel/storageAdapter";
-import { ReminderManager } from "./utils/reminderManager";
-import { ProjectManager } from "./utils/projectManager";
-import { ProjectColumnsManager } from "./utils/projectColumnsManager";
-import { ProjectFolderManager } from "./utils/projectFolderManager";
-import { CategoryManager } from "./utils/categoryManager";
-import { HabitManager } from "./utils/habitManager";
-import { PomodoroManager } from "./utils/pomodoroRecord";
-import { SummaryManager } from "./utils/summaryManager";
-import { createMcpRegistry, type ToolDefinition } from "./kernel/tools";
+import { ReminderManager } from "./components/dataManager/reminderManager";
+import { ProjectManager } from "./components/dataManager/projectManager";
+import { ProjectColumnsManager } from "./components/dataManager/projectColumnsManager";
+import { ProjectFolderManager } from "./components/dataManager/projectFolderManager";
+import { CategoryManager } from "./components/dataManager/categoryManager";
+import { HabitManager } from "./components/dataManager/habitManager";
+import { PomodoroManager } from "./components/dataManager/pomodoroRecord";
+import { SummaryManager } from "./components/dataManager/summaryManager";
+import { createMcpRegistry, type ToolDefinition } from "./kernel/tools/index";
 import { STATUSES_DATA_FILE } from "./kernel/constants";
+import { KernelReminderService } from "./kernel/reminderService";
 
 class KernelPluginBridge {
     private storage: KernelStorage;
@@ -88,11 +89,12 @@ class KernelPluginBridge {
     }
 
     async loadSubscriptionData(): Promise<any> {
-        return this.loadData("ics_subscriptions.json");
+        return await this.loadData("ics-subscriptions.json") || await this.loadData("ics_subscriptions.json");
     }
 
     async loadSubscriptionTasks(subscriptionId: string): Promise<any> {
-        return this.loadData(`subscribe/${subscriptionId}.json`);
+        return await this.loadData(`Subscribe/${subscriptionId}.json`)
+            || await this.loadData(`subscribe/${subscriptionId}.json`);
     }
 
     async loadPomodoroRecords(force: boolean = false): Promise<any> {
@@ -129,9 +131,8 @@ class KernelPluginBridge {
 }
 
 class KernelPlugin {
-    private readonly siyuan: typeof globalThis.siyuan;
+    private readonly siyuan: ISiyuan;
     private readonly logger: ILogger;
-    private readonly mcp: IMcp;
 
     private storage = createKernelStorage();
     private bridge = new KernelPluginBridge(this.storage);
@@ -153,18 +154,53 @@ class KernelPlugin {
 
     private registry: ToolDefinition[] = [];
     private registeredToolNames: string[] = [];
+    private reminderService: KernelReminderService;
 
     constructor() {
         this.siyuan = siyuan;
         this.logger = this.siyuan.logger;
-        this.mcp = this.siyuan.mcp;
+        this.reminderService = new KernelReminderService(this.storage, this.siyuan.client, this.logger, this.siyuan);
 
         this.siyuan.plugin.lifecycle.onload = this.onload.bind(this);
         this.siyuan.plugin.lifecycle.onunload = this.onunload.bind(this);
     }
 
+    private async registerCapability(name: string, config: any, handler: any): Promise<any> {
+        const siyuanAny = this.siyuan as any;
+        if (siyuanAny.agent && typeof siyuanAny.agent.registerCapability === "function") {
+            return await siyuanAny.agent.registerCapability(name, config, handler);
+        }
+        if (siyuanAny.mcp && typeof siyuanAny.mcp.registerTool === "function") {
+            return await siyuanAny.mcp.registerTool(name, config, handler);
+        }
+        throw new Error("Neither siyuan.agent.registerCapability nor siyuan.mcp.registerTool is available");
+    }
+
+    private async unregisterCapability(name: string): Promise<void> {
+        const siyuanAny = this.siyuan as any;
+        if (siyuanAny.agent && typeof siyuanAny.agent.unregisterCapability === "function") {
+            await siyuanAny.agent.unregisterCapability(name);
+            return;
+        }
+        if (siyuanAny.mcp && typeof siyuanAny.mcp.unregisterTool === "function") {
+            await siyuanAny.mcp.unregisterTool(name);
+            return;
+        }
+    }
+
     private async onload(): Promise<void> {
-        await this.logger.info("[kernel] MCP plugin loading");
+        await this.logger.info("[kernel] Agent capability plugin loading");
+        await this.siyuan.rpc.bind('test-webhook', options => this.reminderService.testWebhook(options));
+        await this.siyuan.rpc.bind('test-email', options => this.reminderService.testEmail(options));
+        await this.siyuan.rpc.bind('get-smtp-email-events', () => this.reminderService.getDesktopEmailEvents());
+        await this.siyuan.rpc.bind('claim-smtp-email', ({ key, owner }) => this.reminderService.claimDesktopEmail(key, owner));
+        await this.siyuan.rpc.bind('finish-smtp-email', ({ key, owner, sent }) => this.reminderService.finishDesktopEmail(key, owner, sent));
+        await this.siyuan.rpc.bind('refresh-reminder-schedule', () => this.reminderService.notifyChanged());
+        await this.siyuan.rpc.bind('get-reminder-events', () => this.reminderService.getFrontendEvents());
+        await this.siyuan.rpc.bind('claim-reminder-event', ({ key, owner }) => this.reminderService.claimFrontendEvent(key, owner));
+        await this.siyuan.rpc.bind('ack-reminder-event', ({ key, owner }) => this.reminderService.acknowledgeFrontendEvent(key, owner));
+        await this.siyuan.rpc.bind('release-reminder-event', ({ key, owner }) => this.reminderService.releaseFrontendEvent(key, owner));
+        await this.reminderService.start();
 
         try {
             // Initialize managers to load data cache
@@ -189,27 +225,37 @@ class KernelPlugin {
             });
 
             for (const tool of this.registry) {
-                const registered = await this.mcp.registerTool(tool.name, tool.config, tool.handler);
+                const registered = await this.registerCapability(tool.name, tool.config, tool.handler);
                 this.registeredToolNames.push(tool.name);
-                await this.logger.debug("[kernel] registered MCP tool:", registered.name);
+                await this.logger.debug("[kernel] registered capability:", registered?.name || tool.name);
             }
 
-            await this.logger.info(`[kernel] registered ${this.registeredToolNames.length} MCP tools`);
+            await this.logger.info(`[kernel] registered ${this.registeredToolNames.length} capabilities`);
         } catch (error: any) {
-            await this.logger.error("[kernel] failed to register MCP tools:", error);
-            throw error;
+            await this.logger.error("[kernel] failed to register capabilities:", error);
+            // 工具初始化失败不应终止已启动的后台提醒服务。
         }
     }
 
     private async onunload(): Promise<void> {
-        await this.logger.info("[kernel] MCP plugin unloading");
+        await this.logger.info("[kernel] Agent capability plugin unloading");
+        await this.reminderService.stop();
+        await this.siyuan.rpc.unbind('test-webhook');
+        await this.siyuan.rpc.unbind('test-email');
+        for (const method of ['get-smtp-email-events', 'claim-smtp-email', 'finish-smtp-email']) {
+            await this.siyuan.rpc.unbind(method);
+        }
+        await this.siyuan.rpc.unbind('refresh-reminder-schedule');
+        for (const method of ['get-reminder-events', 'claim-reminder-event', 'ack-reminder-event', 'release-reminder-event']) {
+            await this.siyuan.rpc.unbind(method);
+        }
 
         for (const name of this.registeredToolNames) {
             try {
-                await this.mcp.unregisterTool(name);
-                await this.logger.debug("[kernel] unregistered MCP tool:", name);
+                await this.unregisterCapability(name);
+                await this.logger.debug("[kernel] unregistered capability:", name);
             } catch (error: any) {
-                await this.logger.error(`[kernel] failed to unregister tool ${name}:`, error);
+                await this.logger.error(`[kernel] failed to unregister capability ${name}:`, error);
             }
         }
 

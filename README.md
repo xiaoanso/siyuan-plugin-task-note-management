@@ -6,15 +6,7 @@
 
 见: [CHANGELOG.md](https://cdn.jsdelivr.net/gh/Achuan-2/siyuan-plugin-task-note-management@main/CHANGELOG.md)
 
-## ✨Star History
 
-<a href="https://www.star-history.com/?repos=Achuan-2%2Fsiyuan-plugin-task-note-management&type=date&legend=top-left">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=Achuan-2/siyuan-plugin-task-note-management&type=date&theme=dark&legend=top-left&sealed_token=Ubr0XXFSJikpjTyiulHnRHxofPgScGff0o5c_wsZ2zU6aW7RYb41VRPlUOZpQZsAJ4goevB7A3EVBoTEMrNTTx3_rJKPPZxtfq9vvDiADzXuFZsTlgUoRAHs3UJbWiLbRP7Oml6HC2TBOPheLJMQMhNGBXLtiuDx2DE5Xs_z2qGoYkf1TTiunJqSG9aJ" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=Achuan-2/siyuan-plugin-task-note-management&type=date&legend=top-left&sealed_token=Ubr0XXFSJikpjTyiulHnRHxofPgScGff0o5c_wsZ2zU6aW7RYb41VRPlUOZpQZsAJ4goevB7A3EVBoTEMrNTTx3_rJKPPZxtfq9vvDiADzXuFZsTlgUoRAHs3UJbWiLbRP7Oml6HC2TBOPheLJMQMhNGBXLtiuDx2DE5Xs_z2qGoYkf1TTiunJqSG9aJ" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=Achuan-2/siyuan-plugin-task-note-management&type=date&legend=top-left&sealed_token=Ubr0XXFSJikpjTyiulHnRHxofPgScGff0o5c_wsZ2zU6aW7RYb41VRPlUOZpQZsAJ4goevB7A3EVBoTEMrNTTx3_rJKPPZxtfq9vvDiADzXuFZsTlgUoRAHs3UJbWiLbRP7Oml6HC2TBOPheLJMQMhNGBXLtiuDx2DE5Xs_z2qGoYkf1TTiunJqSG9aJ" />
- </picture>
-</a>
 
 ## 插件如何使用
 
@@ -83,7 +75,7 @@ AI知识库问答：https://zhida.zhihu.com/repositories/7611936317241043831
 
 但现实中，很多笔记软件在“记录”这件事上做得越来越强，在“行动”这件事上却支持得不够。我们可以轻松地收集信息、摘录观点、建立双向链接、整理知识结构，现在还能让AI加速这个信息获取和整理的过程。然而由于往往缺失任务管理的功能，这容易让我们陷入“过度整理”的陷阱——花费大量时间收集各种信息、记各种笔记、给笔记打上各种标签、搭建个人图书馆，却忽略了笔记真正的价值：帮助我们思考、决策和行动。结果就是，笔记越记越多，但真正重要的事却不一定在持续推进。现在AI在整理信息方面已经很强了，但是对自己人生项目的思考、实际的行动、项目的推进是AI没法替代的，还得我们自己去执行。
 
-[思源笔记原生没有本地日程提醒功能](https://ld246.com/article/1749484697307)，数据库又无法展示父子任务架构、没有日历视图等等缺陷，并不方便做任务管理。于是我开发了这个插件。
+[思源笔记原生没有本地日程提醒功能](https://ld246.com/article/1749484697307)，数据库又有无法展示父子任务架构等等缺陷，并不方便做任务管理。于是我开发了这个插件。
 
 我希望它能够帮助我把“想法—计划—执行—复盘”串联起来。我希望它能做到：
 
@@ -184,8 +176,9 @@ AI知识库问答：https://zhida.zhihu.com/repositories/7611936317241043831
 - **任务管理功能**
 
   - **时间管理功能**：支持为文档或块设置时间提醒，支持根据标题智能自动识别时间提醒，支持设置重复周期提醒。通过自定义提醒时间，还可实现一个任务创建多个提醒
-  - **提醒通知功能：** 支持电脑端和移动端系统通知。
+  - **提醒通知功能：** 支持电脑端和移动端系统通知，以及无需打开页面的内核后台 Webhook 通知。
   - **绑定块功能：** 与笔记功能深度绑定，可以绑定文档和块，任务绑定块后可以点击标题跳转到笔记内容，悬浮可以预览笔记内容，更利于打造任务笔记，把笔记当做自己的任务工作台，管理任务、记录笔记。
+  - **数据库条目：** 在数据库条目右键菜单中可以选择“设置任务”或“开始番茄钟”，支持绑定块条目和独立条目；多选条目可批量设置任务。独立条目自动填入标题和数据库条目链接。
   - **任务可绑定习惯**：一个任务完成可自动进行习惯打卡，任务的番茄钟可统计为某个习惯的番茄钟数据
 - **项目看板：**  管理项目中的所有任务，区分进行中、短期待办、长期待办任务。为每个子项目创建不同分组，还可以并行管理多个子项目。
 - **日历视图**：方便查看任务日期安排，日历视图支持显示任务、习惯、番茄钟等数据

@@ -2,9 +2,9 @@
     import { onMount, tick } from "svelte";
     import { i18n } from "../../pluginInstance";
     import { getLocalDateString, getLogicalDateString, getLocaleTag } from "../../utils/dateUtils";
-    import { ProjectManager } from "../../utils/projectManager";
-    import { generateRepeatInstances, getRepeatInstanceOriginalKey } from "@/utils/repeatUtils";
-    import { PomodoroRecordManager } from "@/utils/pomodoroRecord";
+    import { ProjectManager } from "../dataManager/projectManager";
+    import { generateRepeatInstances, getRepeatInstanceOriginalKey } from "../dataManager/repeatUtils";
+    import { PomodoroRecordManager } from "../dataManager/pomodoroRecord";
     import { getLuteInstance } from "../../utils/luteSingleton";
     import { Dialog, showMessage, platformUtils } from "siyuan";
 
@@ -120,13 +120,13 @@
         try {
             await projectManager.initialize();
         } catch (e) {
-            console.warn("初始化项目管理器失败:", e);
+            console.warn("Failed to initialize project manager:", e);
         }
         try {
             pomodoroRecordManager = PomodoroRecordManager.getInstance(plugin);
             await pomodoroRecordManager.initialize();
         } catch (e) {
-            console.warn("初始化番茄记录失败:", e);
+            console.warn("Failed to initialize pomodoro records:", e);
         }
         // 使用插件全局共享的 Lute 实例
         lute = getLuteInstance();
@@ -138,7 +138,7 @@
             showHabit = settings.showHabitInSummary !== false;
             showHabitNotes = settings.showHabitNotesInSummary === true;
         } catch (e) {
-            console.warn("加载设置失败:", e);
+            console.warn("Failed to load settings:", e);
         }
         await loadData();
     });
@@ -165,7 +165,7 @@
             // 构建日期分组数据
             dateGroups = buildDateGroups(groupedTasks, dateRange, stats);
         } catch (error) {
-            console.error("加载任务摘要失败:", error);
+            console.error("Failed to load task summary:", error);
         } finally {
             loading = false;
         }
@@ -435,7 +435,7 @@
 
             return events;
         } catch (error) {
-            console.error("获取事件数据失败:", error);
+            console.error("Failed to get event data:", error);
             return [];
         }
     }
@@ -991,10 +991,14 @@
 
         habits.forEach(habit => {
             dateList.forEach(dateStr => {
-                if (shouldCheckInOnDate(habit, dateStr)) {
-                    totalHabitTargetDays++;
+                const required = shouldCheckInOnDate(habit, dateStr);
+                const checkInRecord = habit.checkIns?.[dateStr];
+                const hasUnscheduledRecord = habit.frequency?.type === "none" &&
+                    (checkInRecord?.count > 0 || checkInRecord?.entries?.length > 0 || checkInRecord?.status?.length > 0);
+                if (required || hasUnscheduledRecord) {
+                    if (required) totalHabitTargetDays++;
                     const isComplete = isHabitComplete(habit, dateStr);
-                    if (isComplete) {
+                    if (required && isComplete) {
                         completedHabitDays++;
                     }
 
@@ -1059,6 +1063,8 @@
         const interval = frequency.interval || 1;
 
         switch (frequency.type) {
+            case "none":
+                return i18n("freqNone");
             case "daily":
                 label = interval === 1 ? i18n("daily") : `${i18n("every")}${interval}${i18n("days")}`;
                 break;
@@ -1135,6 +1141,8 @@
         const startDate = new Date(`${habit.startDate}T00:00:00`);
 
         switch (frequency?.type) {
+            case "none":
+                return false;
             case "daily":
                 if (frequency.interval) {
                     const daysDiff = Math.floor((checkDate.getTime() - startDate.getTime()) / 86400000);
@@ -1234,7 +1242,7 @@
             }
             case "monthly": {
                 if (repeat.monthDays && repeat.monthDays.length > 0) {
-                    const days = `${repeat.monthDays.join("、")}号`;
+                    const days = i18n("repeatMonthDaysLabel", { days: String(repeat.monthDays.join("、")) });
                     return interval === 1
                         ? `🔄 ${i18n("monthly") || "每月"} (${days})`
                         : `🔄 ${i18n("every") || "每"}${interval}${i18n("months") || "月"} (${days})`;
@@ -1250,7 +1258,7 @@
                     parts.push(`${i18n("weekly") || "每周"}(${days.join("、")})`);
                 }
                 if (repeat.monthDays && repeat.monthDays.length) {
-                    parts.push(`${i18n("monthly") || "每月"}(${repeat.monthDays.join("、")}号)`);
+                    parts.push(`${i18n("monthly")}(${i18n('repeatMonthDaysLabel', { days: repeat.monthDays.join(', ') })})`);
                 }
                 if (repeat.months && repeat.months.length) {
                     parts.push(`${i18n("yearly") || "每年"}(${repeat.months.join("、")}${i18n("month") || "月"})`);
@@ -1461,7 +1469,7 @@
                 copyTextToClipboard(content);
             }
         } catch (error) {
-            console.error("复制失败:", error);
+            console.error("Copy failed:", error);
             showMessage(i18n("copyFailed"));
         }
     }
@@ -1713,7 +1721,7 @@
             await navigator.clipboard.write([clipboardItem]);
             showMessage(i18n("copiedToClipboard"));
         } catch (error) {
-            console.error("复制富文本失败，回退为纯文本复制:", error);
+            console.error("Failed to copy rich text; falling back to plain text:", error);
             copyTextToClipboard(fallbackText);
         }
     }
@@ -1787,7 +1795,7 @@
     {/if}
 
     {#if loading}
-        <div class="state-block">加载中...</div>
+        <div class="state-block">{i18n('loading')}</div>
     {:else if dateGroups.length === 0}
         <div class="state-block">{i18n("noTasks")}</div>
     {:else}
@@ -2295,5 +2303,107 @@
         cursor: pointer;
         font-size: 13px;
         color: var(--b3-theme-on-surface);
+    }
+
+    @media (max-width: 768px) {
+        .task-summary-root {
+            height: auto;
+            min-height: 100%;
+            overflow: visible;
+        }
+
+        .task-summary-toolbar {
+            flex-direction: column;
+            align-items: stretch;
+        }
+
+        .filter-buttons,
+        .action-buttons,
+        .task-summary-settings {
+            width: 100%;
+            flex-wrap: nowrap;
+            overflow-x: auto;
+            overflow-y: hidden;
+            padding-bottom: 6px;
+            scrollbar-width: thin;
+            -webkit-overflow-scrolling: touch;
+        }
+
+        .filter-buttons::-webkit-scrollbar,
+        .action-buttons::-webkit-scrollbar,
+        .task-summary-settings::-webkit-scrollbar {
+            height: 6px;
+        }
+
+        .filter-buttons::-webkit-scrollbar-track,
+        .action-buttons::-webkit-scrollbar-track,
+        .task-summary-settings::-webkit-scrollbar-track {
+            background: var(--b3-theme-surface-lighter);
+            border-radius: 3px;
+        }
+
+        .filter-buttons::-webkit-scrollbar-thumb,
+        .action-buttons::-webkit-scrollbar-thumb,
+        .task-summary-settings::-webkit-scrollbar-thumb {
+            background: var(--b3-theme-primary-lighter);
+            border-radius: 3px;
+        }
+
+        .filter-btn,
+        .action-btn,
+        .switch-label {
+            flex: 0 0 auto;
+            white-space: nowrap;
+        }
+
+        .custom-date-picker {
+            flex-direction: column;
+            align-items: stretch;
+            gap: 8px;
+            padding: 10px;
+        }
+
+        .date-inputs {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr);
+            gap: 8px;
+        }
+
+        .date-separator {
+            display: none;
+        }
+
+        .date-field input[type="date"] {
+            width: 100%;
+            box-sizing: border-box;
+        }
+
+        .apply-btn {
+            width: 100%;
+        }
+
+        .task-summary-info-cards {
+            grid-template-columns: minmax(0, 1fr);
+            gap: 8px;
+        }
+
+        .task-summary-content {
+            flex: none;
+            overflow-y: visible;
+            padding-right: 0;
+        }
+
+        .summary-stat-row,
+        .task-project-group,
+        .task-group-list {
+            margin-left: 0;
+            padding-left: 0;
+        }
+
+        .task-item,
+        .task-body,
+        .task-line {
+            min-width: 0;
+        }
     }
 </style>

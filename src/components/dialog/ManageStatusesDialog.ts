@@ -1,4 +1,5 @@
 import { Dialog, showMessage, confirm } from "siyuan";
+import { getDragHandleIcon } from "../../utils/dragHandleIcon";
 import { i18n } from "../../pluginInstance";
 import { getLocalDateTimeString } from "../../utils/dateUtils";
 import { saveReminders } from "../../utils/icsSubscription";
@@ -172,12 +173,15 @@ export async function showManageKanbanStatusesDialog(view: any) {
             });
 
             const dragHandle = document.createElement('span');
-            dragHandle.innerHTML = '⋮⋮';
+            dragHandle.innerHTML = getDragHandleIcon();
             dragHandle.style.cssText = `
-                font-size: 14px;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                flex-shrink: 0;
                 color: var(--b3-theme-on-surface);
                 opacity: 0.6;
-                cursor: move;
+                cursor: grab;
                 padding: 2px 4px;
                 user-select: none;
             `;

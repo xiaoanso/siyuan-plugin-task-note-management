@@ -1,7 +1,8 @@
 import type { IStorage, IDataObject } from "siyuan/kernel";
+import { REMINDER_DATA_FILE } from "./constants";
 
 export interface KernelStorage {
-    loadData(path: string): Promise<any>;
+    loadData(path: string, strict?: boolean): Promise<any>;
     saveData(path: string, data: any): Promise<void>;
     removeData(path: string): Promise<void>;
     readDir(dir: string): Promise<Array<{ name: string; isDir: boolean; isSymlink: boolean; updated: number }>>;
@@ -11,7 +12,7 @@ export function createKernelStorage(): KernelStorage {
     const storage = (globalThis as any).siyuan.storage as IStorage;
 
     return {
-        async loadData(path: string): Promise<any> {
+        async loadData(path: string, strict: boolean = false): Promise<any> {
             try {
                 const obj: IDataObject = await storage.get(path);
                 const text = await obj.text();
@@ -20,9 +21,12 @@ export function createKernelStorage(): KernelStorage {
                 }
                 return JSON.parse(text);
             } catch (error: any) {
-                if (error?.message?.includes("not exist") || error?.message?.includes("does not exist")) {
+                const message = String(error?.message || error);
+                if (/not exist|no such file|cannot find the file/i.test(message)) {
                     return null;
                 }
+                // 提醒和严格读取的后台状态出错时终止操作，避免覆盖或丢失去重记录。
+                if (strict || path === REMINDER_DATA_FILE) throw error;
                 console.warn(`[kernel] loadData failed for ${path}:`, error);
                 return null;
             }

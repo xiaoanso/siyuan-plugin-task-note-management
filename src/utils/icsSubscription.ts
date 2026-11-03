@@ -1,4 +1,4 @@
-import { pushErrMsg, pushMsg, putFile, getFile, removeFile } from '../api';
+import { pushErrMsg, pushMsg, putFile, getFile, removeFile, forwardProxy } from '../api';
 import { ParsedIcsEvent, parseIcsFile, isEventPast, resolveDefaultKanbanStatus } from './icsImport';
 import { deleteCalDavTask, fetchCalDavEvents, putCalDavTask } from './caldavSubscription';
 import { i18n } from "../pluginInstance";
@@ -469,6 +469,10 @@ export async function deleteSubscriptionReminderTask(plugin: any, reminder: any)
 
 export async function saveReminders(plugin: any, allReminders: any): Promise<void> {
     try {
+        if (plugin && allReminders) {
+            plugin.reminderDataCache = allReminders;
+        }
+
         const localReminders: any = {};
         const subRemindersBySubId: { [subId: string]: any } = {};
 
@@ -506,20 +510,23 @@ export async function saveReminders(plugin: any, allReminders: any): Promise<voi
 
 
 /**
- * Fetch ICS content from URL
+ * Fetch ICS content from URL.
+ * Falls back to SiYuan kernel forwardProxy (same-origin) when direct
+ * browser fetch fails, e.g. the ICS host omits the
+ * `Access-Control-Allow-Origin` header (CORS failure).
  */
 async function fetchIcsContent(url: string): Promise<string> {
-    try {
-        // Convert webcal:// and webcals:// protocols to http:// and https://
-        // webcal:// is just an alias for http://
-        // webcals:// is just an alias for https://
-        let fetchUrl = url;
-        if (url.startsWith('webcal://')) {
-            fetchUrl = 'http://' + url.substring(9);
-        } else if (url.startsWith('webcals://')) {
-            fetchUrl = 'https://' + url.substring(10);
-        }
+    // Convert webcal:// and webcals:// protocols to http:// and https://
+    // webcal:// is just an alias for http://
+    // webcals:// is just an alias for https://
+    let fetchUrl = url;
+    if (url.startsWith('webcal://')) {
+        fetchUrl = 'http://' + url.substring(9);
+    } else if (url.startsWith('webcals://')) {
+        fetchUrl = 'https://' + url.substring(10);
+    }
 
+    try {
         const response = await fetch(fetchUrl, {
             method: 'GET',
             headers: {
@@ -531,11 +538,29 @@ async function fetchIcsContent(url: string): Promise<string> {
             throw new Error(`HTTP ${response.status}: ${response.statusText}`);
         }
 
-        const content = await response.text();
-        return content;
-    } catch (error) {
-        console.error('Failed to fetch ICS from URL:', url, error);
-        throw error;
+        return await response.text();
+    } catch (directError) {
+        console.warn('Direct ICS fetch failed, fallback to forwardProxy:', fetchUrl, directError);
+        try {
+            const proxied = await forwardProxy(
+                fetchUrl,
+                'GET',
+                {},
+                [],
+                15000,
+                'text/calendar; charset=utf-8'
+            );
+            if (!proxied || typeof proxied.status !== 'number' || proxied.status < 200 || proxied.status >= 300) {
+                throw new Error(`Proxy HTTP ${proxied?.status}: ${fetchUrl}`);
+            }
+            if (typeof proxied.body !== 'string' || !proxied.body) {
+                throw new Error(`Proxy empty body: ${fetchUrl}`);
+            }
+            return proxied.body;
+        } catch (proxyError) {
+            console.error('Failed to fetch ICS from URL:', url, proxyError);
+            throw proxyError;
+        }
     }
 }
 
@@ -724,13 +749,13 @@ export async function syncAllSubscriptions(plugin: any): Promise<void> {
 
         // Show notification
         if (errorCount > 0) {
-            await pushErrMsg(`日历订阅同步完成：成功 ${successCount} 个，失败 ${errorCount} 个`);
+            await pushErrMsg(i18n("calendarSyncPartial", { success: String(successCount), failed: String(errorCount) }));
         } else {
-            await pushMsg(`日历订阅同步成功：已同步 ${successCount} 个日历`);
+            await pushMsg(i18n("calendarSyncSuccess", { count: String(successCount) }));
         }
     } catch (error) {
         console.error('Failed to sync all subscriptions:', error);
-        await pushErrMsg('日历订阅同步失败: ' + (error.message || error));
+        await pushErrMsg(i18n("calendarSyncFailedPrefix") + (error.message || error));
     }
 }
 
@@ -830,7 +855,7 @@ export async function syncHolidays(plugin: any, url: string): Promise<boolean> {
             if (event.date) {
                 const title = event.title || '';
                 let type: 'holiday' | 'workday' = 'holiday';
-                // 通常节假日 ICS 中，补班会带有 “班” 字，放假带有 “休” 字
+                // 这是外部日历内容的解析规则，不使用界面显示的 W/H 等本地化标记。
                 if (title.includes('班') || title.toLowerCase().includes('work')) {
                     type = 'workday';
                 } else if (title.includes('休') || title.toLowerCase().includes('holiday') || title.toLowerCase().includes('off')) {

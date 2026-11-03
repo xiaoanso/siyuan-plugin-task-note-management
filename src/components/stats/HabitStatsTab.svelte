@@ -1,13 +1,13 @@
 <script lang="ts">
 import { onMount, tick } from "svelte";
-import type { Habit } from "../HabitPanel";
-import { HabitDayDialog } from "../HabitDayDialog";
+import type { Habit } from "../../utils/habitUtils";
+import { HabitDayDialog } from "../dialog/HabitDayDialog";
 import { HabitStatsDialog } from "./HabitStatsDialog";
-import { HabitEditDialog } from "../HabitEditDialog";
+import { HabitEditDialog } from "../dialog/HabitEditDialog";
 import { DEFAULT_SETTINGS } from "../../index";
-import { PomodoroRecordManager } from "../../utils/pomodoroRecord";
-import { getLogicalDateString } from "../../utils/dateUtils";
-import { HabitGroupManager, type HabitGroup } from "../../utils/habitGroupManager";
+import { PomodoroRecordManager } from "../dataManager/pomodoroRecord";
+import { getLogicalDateString, getLocaleTag } from "../../utils/dateUtils";
+import { HabitGroupManager, type HabitGroup } from "../dataManager/habitGroupManager";
 import { i18n } from "../../pluginInstance";
 import {
     buildLinkedHabitPomodoroData,
@@ -17,7 +17,10 @@ import {
 } from "../../utils/linkedHabitPomodoro";
 import {
     getHabitGoalType as getHabitGoalTypeUtil,
+    getHabitCompletedDaysCount,
     getHabitPomodoroTargetMinutes as getHabitPomodoroTargetMinutesUtil,
+    getHabitStreakDays,
+    isHabitCheckInDayComplete,
     formatHabitReminderTimeDisplay,
     shouldCheckInOnDate as shouldCheckInOnDateUtil,
     getHabitReminderTimes
@@ -58,7 +61,9 @@ type HabitCheckInLogItem = {
     hasNote: boolean;
 };
 
-const WEEKDAY_NAMES = ["日", "一", "二", "三", "四", "五", "六"];
+const WEEKDAY_NAMES = Array.from({ length: 7 }, (_, day) =>
+    new Date(2026, 0, 4 + day).toLocaleDateString(getLocaleTag(), { weekday: 'short' })
+);
 const COLOR_POOL = [
     "#7bc96f", "#6ccff6", "#f7a8b8", "#c49bff", "#f4b183",
     "#82c4c3", "#89b4fa", "#f9c97f", "#a3d9a5", "#e8a8ff",
@@ -104,7 +109,7 @@ async function initPomodoro() {
         pomodoroReady = true;
         pomodoroStatsRevision += 1;
     } catch (error) {
-        console.warn("初始化番茄统计失败，概览将不显示番茄统计", error);
+        console.warn("Failed to initialize pomodoro statistics; overview will omit pomodoro statistics", error);
         pomodoroReady = false;
     }
 }
@@ -115,7 +120,7 @@ async function loadGroups() {
         await manager.initialize();
         groupList = manager.getAllGroups();
     } catch (error) {
-        console.warn("加载习惯分组失败", error);
+        console.warn("Failed to load habit groups", error);
         groupList = [];
     }
 }
@@ -129,7 +134,7 @@ async function loadWeekStartDay() {
             }
         }
     } catch (error) {
-        console.warn("读取 weekStartDay 失败，使用默认值", error);
+        console.warn("Failed to read weekStartDay; using default", error);
     }
 }
 
@@ -158,8 +163,8 @@ async function loadHabits() {
         const habitData = await plugin.loadHabitData();
         habits = Object.values(habitData || {}) as Habit[];
     } catch (error) {
-        console.error("加载习惯数据失败:", error);
-        errorMessage = "加载习惯数据失败";
+        console.error("Failed to load habit data:", error);
+        errorMessage = i18n("loadHabitsFailed");
         habits = [];
         linkedTaskPomodoroStats = new Map();
     } finally {
@@ -180,8 +185,8 @@ function getTodayDateKey(): string {
 
 function formatFullDateLabel(day: Date): string {
     const dateStr = getDateKey(day);
-    const dayName = WEEKDAY_NAMES[day.getDay()];
-    return `${dateStr} 星期${dayName}`;
+    const dayName = day.toLocaleDateString(getLocaleTag(), { weekday: 'long' });
+    return `${dateStr} ${dayName}`;
 }
 
 function addDays(date: Date, days: number): Date {
@@ -270,34 +275,7 @@ function buildGroupedSections(input: Habit[]): HabitGroupSection[] {
     return sections;
 }
 
-function getSuccessCheckInCount(habit: Habit, dateStr: string): number {
-    const checkIn = habit.checkIns?.[dateStr];
-    if (!checkIn) return 0;
-
-    const emojis: string[] = [];
-    if (checkIn.entries && checkIn.entries.length > 0) {
-        checkIn.entries.forEach(entry => {
-            if (entry.emoji) emojis.push(entry.emoji);
-        });
-    } else if (checkIn.status && checkIn.status.length > 0) {
-        checkIn.status.forEach(emoji => {
-            if (emoji) emojis.push(emoji);
-        });
-    }
-
-    const successFromEmoji = emojis.filter(emoji => {
-        const config = habit.checkInEmojis?.find(item => item.emoji === emoji);
-        return config ? config.countsAsSuccess !== false : true;
-    }).length;
-
-    // 兼容旧数据：只有在没有 status/entries 且有 count 时才使用 count
-    if (emojis.length === 0 && typeof checkIn.count === "number" && checkIn.count > 0) {
-        return checkIn.count;
-    }
-    return successFromEmoji;
-}
-
-function getHabitGoalType(habit: Habit): "count" | "pomodoro" {
+function getHabitGoalType(habit: Habit) {
     return getHabitGoalTypeUtil(habit);
 }
 
@@ -393,7 +371,7 @@ function buildCheckInLogsForHabit(habit: Habit): HabitCheckInLogItem[] {
                 logs.push({
                     id: `${habit.id}-${dateStr}-entry-${index}-${entry.timestamp || ""}`,
                     habit,
-                    habitTitle: habit.title || "未命名习惯",
+                    habitTitle: habit.title || i18n("unnamedHabit"),
                     habitIcon: habit.icon || "🌱",
                     groupName,
                     dateStr,
@@ -412,7 +390,7 @@ function buildCheckInLogsForHabit(habit: Habit): HabitCheckInLogItem[] {
                 logs.push({
                     id: `${habit.id}-${dateStr}-status-${index}-${checkIn.timestamp || ""}`,
                     habit,
-                    habitTitle: habit.title || "未命名习惯",
+                    habitTitle: habit.title || i18n("unnamedHabit"),
                     habitIcon: habit.icon || "🌱",
                     groupName,
                     dateStr,
@@ -431,7 +409,7 @@ function buildCheckInLogsForHabit(habit: Habit): HabitCheckInLogItem[] {
             logs.push({
                 id: `${habit.id}-${dateStr}-count-${i}-${checkIn.timestamp || ""}`,
                 habit,
-                habitTitle: habit.title || "未命名习惯",
+                habitTitle: habit.title || i18n("unnamedHabit"),
                 habitIcon: habit.icon || "🌱",
                 groupName,
                 dateStr,
@@ -472,12 +450,16 @@ function shouldCheckInOnDate(habit: Habit, dateStr: string): boolean {
 }
 
 function hasRequiredDateInRange(habit: Habit, dates: Date[]): boolean {
+    // 自由记录的习惯也保留在统计日历中，方便查看和补录。
+    if (habit.frequency.type === "none") return true;
     return dates.some(day => shouldCheckInOnDate(habit, getDateKey(day)));
 }
 
 function getFrequencyText(frequency: Habit["frequency"]): string {
     const { type, interval, weekdays, monthDays, months } = frequency;
     switch (type) {
+        case "none":
+            return i18n("freqNone");
         case "daily":
             return interval ? i18n("freqEveryNDays", { n: String(interval) }) : i18n("freqEveryDay");
         case "weekly":
@@ -527,13 +509,10 @@ function getHabitDateRangeText(habit: Habit): string {
 }
 
 function isCheckInComplete(habit: Habit, dateStr: string): boolean {
-    if (getHabitGoalType(habit) === "pomodoro") {
-        const target = getHabitPomodoroTargetMinutes(habit);
-        const current = getHabitPomodoroFocusMinutes(habit, dateStr);
-        return current >= target;
-    }
-    const target = habit.target || 1;
-    return getSuccessCheckInCount(habit, dateStr) >= target;
+    return isHabitCheckInDayComplete(habit, dateStr, {
+        getPomodoroFocusMinutes: (habitId, logicalDate) =>
+            habitId === habit.id ? getHabitPomodoroFocusMinutes(habit, logicalDate) : 0
+    });
 }
 
 function countTotalCheckIns(habit: Habit): number {
@@ -555,30 +534,17 @@ function countTotalCheckIns(habit: Habit): number {
 }
 
 function calculateStreak(habit: Habit): number {
-    const completedDates = Object.keys(habit.checkIns || {})
-        .filter(dateStr => isCheckInComplete(habit, dateStr))
-        .sort();
-
-    if (completedDates.length === 0) return 0;
-
-    const completedSet = new Set(completedDates);
-    let streak = 0;
-    let current = new Date();
-    current.setHours(0, 0, 0, 0);
-
-    while (true) {
-        const key = getDateKey(current);
-        if (!completedSet.has(key)) break;
-        streak++;
-        current = addDays(current, -1);
-    }
-
-    return streak;
+    return getHabitStreakDays(habit, getLogicalDateString(), {
+        getPomodoroFocusMinutes: (habitId, logicalDate) =>
+            habitId === habit.id ? getHabitPomodoroFocusMinutes(habit, logicalDate) : 0
+    });
 }
 
 function getOverviewStats(habit: Habit, _revision: number): HabitOverviewStats {
-    const checkInDays = Object.keys(habit.checkIns || {})
-        .filter(dateStr => isCheckInComplete(habit, dateStr)).length;
+    const checkInDays = getHabitCompletedDaysCount(habit, {
+        getPomodoroFocusMinutes: (habitId, logicalDate) =>
+            habitId === habit.id ? getHabitPomodoroFocusMinutes(habit, logicalDate) : 0
+    });
     const today = getLogicalDateString();
     let todayPomodoro = 0;
     let totalPomodoro = 0;
@@ -674,7 +640,8 @@ function getWeekRangeText(): string {
     if (weekDates.length === 0) return "";
     const start = weekDates[0];
     const end = weekDates[weekDates.length - 1];
-    return `${start.getMonth() + 1}月${start.getDate()}日 - ${end.getMonth() + 1}月${end.getDate()}日`;
+    const options: Intl.DateTimeFormatOptions = { month: 'short', day: 'numeric' };
+    return `${start.toLocaleDateString(getLocaleTag(), options)} - ${end.toLocaleDateString(getLocaleTag(), options)}`;
 }
 
 function getMonthDate(): Date {
@@ -684,7 +651,7 @@ function getMonthDate(): Date {
 
 function getMonthTitle(): string {
     const monthDate = getMonthDate();
-    return `${monthDate.getFullYear()}年${monthDate.getMonth() + 1}月`;
+    return monthDate.toLocaleDateString(getLocaleTag(), { year: 'numeric', month: 'long' });
 }
 
 function getCurrentYear(): number {
@@ -692,7 +659,7 @@ function getCurrentYear(): number {
 }
 
 function getYearTitle(): string {
-    return `${getCurrentYear()}年`;
+    return new Date(getCurrentYear(), 0, 1).toLocaleDateString(getLocaleTag(), { year: 'numeric' });
 }
 
 function getYearMonthRows(year: number): Array<{ month: number; cells: Array<Date | null> }> {
@@ -773,7 +740,7 @@ async function openHabitEdit(habit: Habit) {
             window.dispatchEvent(new CustomEvent("habitUpdated"));
             await loadHabits();
         } catch (error) {
-            console.error("保存习惯编辑失败:", error);
+            console.error("Failed to save habit edits:", error);
         }
     }, plugin);
     dialog.show();
@@ -791,7 +758,7 @@ async function openHabitStats(habit: Habit) {
             window.dispatchEvent(new CustomEvent("habitUpdated"));
             await loadHabits();
         } catch (error) {
-            console.error("保存习惯统计变更失败:", error);
+            console.error("Failed to save habit statistics changes:", error);
         }
     }, plugin, defaultToLastCheckIn);
     dialog.show();
@@ -985,19 +952,19 @@ $: if (logPage < 1) logPage = 1;
 
 <div class="habit-stats-root">
     <div class="stats-nav">
-        <button class:active={activeTab === "overview"} on:click={() => activeTab = "overview"}>概览</button>
-        <button class:active={activeTab === "logs"} on:click={() => activeTab = "logs"}>打卡日志</button>
-        <button class:active={activeTab === "week"} on:click={() => activeTab = "week"}>周打卡视图</button>
-        <button class:active={activeTab === "month"} on:click={() => activeTab = "month"}>月打卡视图</button>
-        <button class:active={activeTab === "year"} on:click={() => activeTab = "year"}>年视图</button>
+        <button class:active={activeTab === "overview"} on:click={() => activeTab = "overview"}>{i18n('overview')}</button>
+        <button class:active={activeTab === "logs"} on:click={() => activeTab = "logs"}>{i18n('habitLogTitle')}</button>
+        <button class:active={activeTab === "week"} on:click={() => activeTab = "week"}>{i18n('habitWeeklyCheckInView')}</button>
+        <button class:active={activeTab === "month"} on:click={() => activeTab = "month"}>{i18n('habitMonthlyCheckInView')}</button>
+        <button class:active={activeTab === "year"} on:click={() => activeTab = "year"}>{i18n('habitTimeYearView')}</button>
     </div>
 
     {#if loading}
-        <div class="state-block">加载中...</div>
+        <div class="state-block">{i18n('loading')}</div>
     {:else if errorMessage}
         <div class="state-block error">{errorMessage}</div>
     {:else if habits.length === 0}
-        <div class="state-block">暂无习惯数据</div>
+        <div class="state-block">{i18n('noHabitStatsData')}</div>
     {:else if activeTab === "overview"}
         <div class="overview-sub-nav">
             <button class:active={overviewSubTab === "active"} on:click={() => overviewSubTab = "active"}>
@@ -1033,8 +1000,8 @@ $: if (logPage < 1) logPage = 1;
                                 <div class="overview-main">
                                     <div class="habit-title-row">
                                         <div class="habit-title">{habit.icon || "🌱"} {habit.title}</div>
-                                        <button class="view-btn" on:click={() => openHabitStats(habit)}>查看统计</button>
-                                        <button class="edit-btn" on:click={() => openHabitEdit(habit)}>编辑习惯</button>
+                                        <button class="view-btn" on:click={() => openHabitStats(habit)}>{i18n('viewStatsMenuItem')}</button>
+                                        <button class="edit-btn" on:click={() => openHabitEdit(habit)}>{i18n('editHabitMenuItem')}</button>
                                     </div>
                                     <div class="habit-meta-row">
                                         <span class="habit-meta-item">
@@ -1055,25 +1022,25 @@ $: if (logPage < 1) logPage = 1;
                                     <div class="stat-grid">
                                         <div class="stat-item">
                                             <div class="stat-value">{stats.totalCheckIns}</div>
-                                            <div class="stat-label">总打卡次数</div>
+                                            <div class="stat-label">{i18n('statsTotalCheckIns')}</div>
                                         </div>
                                         <div class="stat-item">
                                             <div class="stat-value">{stats.checkInDays}</div>
-                                            <div class="stat-label">打卡天数</div>
+                                            <div class="stat-label">{i18n('statsCheckInDays')}</div>
                                         </div>
                                         <div class="stat-item">
                                             <div class="stat-value">{stats.streak}</div>
-                                            <div class="stat-label">连续打卡天数</div>
+                                            <div class="stat-label">{i18n('statsStreak')}</div>
                                         </div>
                                     </div>
                                     {#if stats.totalPomodoro > 0 || stats.totalPomodoroMinutes > 0}
                                         <div class="pomodoro-row">
                                             <div class="pomodoro-item">
-                                                <span class="pomodoro-label">🍅 今日番茄钟</span>
+                                                <span class="pomodoro-label">{i18n('habitTodayPomodoroLabel')}</span>
                                                 <span class="pomodoro-value">{stats.todayPomodoro}（{formatMinutes(stats.todayPomodoroMinutes)}）</span>
                                             </div>
                                             <div class="pomodoro-item">
-                                                <span class="pomodoro-label">🍅 总番茄钟</span>
+                                                <span class="pomodoro-label">{i18n('habitTotalPomodoroLabel')}</span>
                                                 <span class="pomodoro-value">{stats.totalPomodoro}（{formatMinutes(stats.totalPomodoroMinutes)}）</span>
                                             </div>
                                         </div>
@@ -1091,14 +1058,14 @@ $: if (logPage < 1) logPage = 1;
                 <button class="nav-btn" on:click={prevWeek}>◀</button>
                 <div class="date-range">{weekRangeText}</div>
                 <div class="toolbar-right">
-                    <button class="today-btn" on:click={resetWeek}>本周</button>
+                    <button class="today-btn" on:click={resetWeek}>{i18n('thisWeek')}</button>
                     <button class="nav-btn" on:click={nextWeek}>▶</button>
                 </div>
             </div>
 
             <div class="week-list" bind:this={weekListEl}>
                 {#if weekVisibleSections.length === 0}
-                    <div class="state-block">本周没有需要打卡的习惯</div>
+                    <div class="state-block">{i18n('noHabitsToCheckInThisWeek')}</div>
                 {:else}
                     {#each weekVisibleSections as section}
                         <div class="group-mini-header">{section.groupName} ({section.habits.length})</div>
@@ -1116,7 +1083,7 @@ $: if (logPage < 1) logPage = 1;
                                     <div
                                         class="week-cell {done ? 'done' : ''} {!required ? 'not-required' : ''} {isToday && required ? 'today' : ''} ariaLabel"
                                         style={`--habit-color: ${getHabitColor(habit)};`}
-                                        aria-label={`${formatFullDateLabel(day)}${checkInDetails.length > 0 ? '\n' + checkInDetails.join('\n') : (done ? "\n已打卡" : "\n未打卡")}`}
+                                        aria-label={`${formatFullDateLabel(day)}\n${checkInDetails.length > 0 ? checkInDetails.join('\n') : i18n(done ? 'habitCheckedInState' : 'habitNotCheckedInState')}`}
                                         on:click={() => openHabitDayEditor(habit, dateStr)}
                                     >
                                             {#if emojis.length > 0}
@@ -1141,13 +1108,13 @@ $: if (logPage < 1) logPage = 1;
                 <button class="nav-btn" on:click={prevMonth}>◀</button>
                 <div class="date-range">{monthTitle}</div>
                 <div class="toolbar-right">
-                    <button class="today-btn" on:click={resetMonth}>本月</button>
+                    <button class="today-btn" on:click={resetMonth}>{i18n('thisMonth')}</button>
                     <button class="nav-btn" on:click={nextMonth}>▶</button>
                 </div>
             </div>
 
             {#if monthVisibleSections.length === 0}
-                <div class="state-block">本月没有需要打卡的习惯</div>
+                <div class="state-block">{i18n('noHabitsToCheckInThisMonth')}</div>
             {:else}
                 {#each monthVisibleSections as section}
                     <div class="group-mini-header">{section.groupName} ({section.habits.length})</div>
@@ -1174,7 +1141,7 @@ $: if (logPage < 1) logPage = 1;
                                             <div
                                                 class="month-day {done ? 'done' : ''} {!required ? 'not-required' : ''} {isToday && required ? 'today' : ''} ariaLabel"
                                                 style={`--habit-color: ${getHabitColor(habit)};`}
-                                                aria-label={`${formatFullDateLabel(day)}${dayCheckInDetails.length > 0 ? '\n' + dayCheckInDetails.join('\n') : (done ? "\n已打卡" : "\n未打卡")}`}
+                                                aria-label={`${formatFullDateLabel(day)}\n${dayCheckInDetails.length > 0 ? dayCheckInDetails.join('\n') : i18n(done ? 'habitCheckedInState' : 'habitNotCheckedInState')}`}
                                                 on:click={() => openHabitDayEditor(habit, dateStr)}
                                             >
                                                 <div class="month-day-content">
@@ -1203,14 +1170,14 @@ $: if (logPage < 1) logPage = 1;
                 <button class="nav-btn" on:click={prevYear}>◀</button>
                 <div class="date-range">{yearTitle}</div>
                 <div class="toolbar-right">
-                    <button class="today-btn" on:click={resetYear}>今年</button>
+                    <button class="today-btn" on:click={resetYear}>{i18n('icsDateFilterThisYear')}</button>
                     <button class="nav-btn" on:click={nextYear}>▶</button>
                 </div>
             </div>
 
             <div class="year-list" bind:this={yearListEl}>
                 {#if yearVisibleSections.length === 0}
-                    <div class="state-block">今年没有需要打卡的习惯</div>
+                    <div class="state-block">{i18n('noHabitsToCheckInThisYear')}</div>
                 {:else}
                     {#each yearVisibleSections as section}
                         <div class="group-mini-header">{section.groupName} ({section.habits.length})</div>
@@ -1221,14 +1188,14 @@ $: if (logPage < 1) logPage = 1;
                                     <div class="year-card-title">{habit.icon || "🌱"} {habit.title}</div>
                                     <div class="year-card-meta">
                                         <span>{yStats.completionRate.toFixed(0)}%</span>
-                                        <span>{yStats.yearCheckInDays}天</span>
+                                        <span>{i18n('habitCheckInDayCount', { count: String(yStats.yearCheckInDays) })}</span>
                                     </div>
                                 </div>
 
                                 <div class="year-grid">
                                     {#each yearMonthRows as monthRow}
                                         <div class="year-month-row">
-                                            <div class="year-month-label">{monthRow.month + 1}月</div>
+                                            <div class="year-month-label">{new Date(currentYear, monthRow.month, 1).toLocaleDateString(getLocaleTag(), { month: 'short' })}</div>
                                             <div class="year-month-cells">
                                                 {#each monthRow.cells as day}
                                                     {#if !day}
@@ -1242,7 +1209,7 @@ $: if (logPage < 1) logPage = 1;
                                                         {@const dayCheckInDetails = getCheckInDetails(habit, dateStr)}
                                                         <div
                                                             class="year-day {done ? 'done' : ''} {!required ? 'not-required' : ''} {isToday && required ? 'today' : ''} ariaLabel"
-                                                            aria-label={`${formatFullDateLabel(day)}${dayCheckInDetails.length > 0 ? '\n' + dayCheckInDetails.join('\n') : (done ? "\n已打卡" : "\n未打卡")}`}
+                                                            aria-label={`${formatFullDateLabel(day)}\n${dayCheckInDetails.length > 0 ? dayCheckInDetails.join('\n') : i18n(done ? 'habitCheckedInState' : 'habitNotCheckedInState')}`}
                                                             on:click={() => openHabitDayEditor(habit, dateStr)}
                                                         >
                                                             {#if dayEmojis.length > 0}
@@ -1269,27 +1236,27 @@ $: if (logPage < 1) logPage = 1;
         <div class="logs-panel">
             <div class="logs-toolbar">
                 <div class="log-filter-item">
-                    <span>开始日期</span>
+                    <span>{i18n('startDate')}</span>
                     <input type="date" bind:value={logStartDate} />
                 </div>
                 <div class="log-filter-item">
-                    <span>结束日期</span>
+                    <span>{i18n('endDate')}</span>
                     <input type="date" bind:value={logEndDate} />
                 </div>
                 <label class="log-note-filter">
                     <input type="checkbox" bind:checked={logOnlyWithNote} />
-                    仅看有备注
+                    {i18n('onlyWithNotes')}
                 </label>
-                <button class="b3-button b3-button--outline" on:click={resetLogFilters}>重置筛选</button>
+                <button class="b3-button b3-button--outline" on:click={resetLogFilters}>{i18n('resetFilters')}</button>
             </div>
 
             <div class="logs-summary">
-                共 {filteredCheckInLogs.length} 条日志，每页 {LOG_PAGE_SIZE} 条
+                {i18n('habitLogTotal', { count: String(filteredCheckInLogs.length), pageSize: String(LOG_PAGE_SIZE) })}
             </div>
 
             <div class="logs-list" bind:this={logsListEl}>
                 {#if pagedCheckInLogs.length === 0}
-                    <div class="state-block">当前筛选条件下没有打卡日志</div>
+                    <div class="state-block">{i18n('noCheckInLogsMatching')}</div>
                 {:else}
                     {#each pagedCheckInLogs as log}
                         <div class="log-card">
@@ -1304,12 +1271,12 @@ $: if (logPage < 1) logPage = 1;
                                 <div class="log-content">
                                     <span class="log-emoji">{log.emoji}</span>
                                     <span class:log-note-empty={!log.hasNote}>
-                                        {log.hasNote ? log.note : "无备注"}
+                                        {log.hasNote ? log.note : i18n('noNoteText')}
                                     </span>
                                 </div>
                             </div>
                             <div class="log-actions">
-                                <button class="view-btn" on:click={() => openHabitDayEditor(log.habit, log.dateStr)}>查看当天</button>
+                                <button class="view-btn" on:click={() => openHabitDayEditor(log.habit, log.dateStr)}>{i18n('viewThisDay')}</button>
                             </div>
                         </div>
                     {/each}
@@ -1318,7 +1285,7 @@ $: if (logPage < 1) logPage = 1;
 
             <div class="logs-pagination">
                 <button class="nav-btn" on:click={prevLogPage} disabled={logPage <= 1}>◀</button>
-                <div class="log-page-info">第 {logPage} / {totalLogPages} 页</div>
+                <div class="log-page-info">{i18n('pageOfPages', { page: String(logPage), pages: String(totalLogPages) })}</div>
                 <button class="nav-btn" on:click={() => nextLogPage(totalLogPages)} disabled={logPage >= totalLogPages}>▶</button>
             </div>
         </div>
@@ -1335,13 +1302,34 @@ $: if (logPage < 1) logPage = 1;
 
     .stats-nav {
         display: flex;
+        flex: 0 0 auto;
+        align-items: center;
         gap: 8px;
         border-bottom: 1px solid var(--b3-border-color);
         padding-bottom: 10px;
-        flex-wrap: wrap;
+        flex-wrap: nowrap;
+        overflow-x: auto;
+        overflow-y: hidden;
+        scrollbar-width: thin;
+        -webkit-overflow-scrolling: touch;
+    }
+
+    .stats-nav::-webkit-scrollbar {
+        height: 6px;
+    }
+
+    .stats-nav::-webkit-scrollbar-track {
+        background: var(--b3-theme-surface-lighter);
+        border-radius: 3px;
+    }
+
+    .stats-nav::-webkit-scrollbar-thumb {
+        background: var(--b3-theme-primary-lighter);
+        border-radius: 3px;
     }
 
     .stats-nav button {
+        flex: 0 0 auto;
         border: 1px solid var(--b3-border-color);
         background: var(--b3-theme-surface);
         color: var(--b3-theme-on-surface);

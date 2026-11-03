@@ -5,10 +5,14 @@
  * 供侧边栏面板、看板视图、四象限视图等各模块统一调用，以保证整体插件中任务 UI 和交互逻辑的一致性。
  */
 import { colorWithOpacity } from "../../utils/uiUtils";
+import type { TaskHierarchyIndex } from '../../utils/taskHierarchy';
+import { updateBindBlockAtrrs } from "../../api";
 import { getLuteInstance } from "../../utils/luteSingleton";
 import { i18n } from "../../pluginInstance";
+import { showMessage } from "siyuan";
 import { getLocalDateString, getLocalDateTimeString, compareDateStrings, getLogicalDateString, getRelativeDateString, getLocaleTag } from "../../utils/dateUtils";
-import { getRepeatDescription } from "../../utils/repeatUtils";
+import { getRepeatDescription, getRepeatInstanceOriginalKey, parseReminderInstanceId, patchRepeatInstanceState } from "../dataManager/repeatUtils";
+import { getAllReminders, saveReminders } from "../../utils/icsSubscription";
 import { getSolarDateLunarString } from "../../utils/lunarUtils";
 import { shouldTreatStartDateOnlyAsOverdue, isOpenEndedStartDateTask } from "../../utils/startDateOverdue";
 import { getReminderSkipWeekendsEffective, getReminderSkipHolidaysEffective, shouldSkipReminderOnDate } from "../../utils/reminderSkipDate";
@@ -29,6 +33,8 @@ export interface TaskRenderContext {
     showCategoryBadge?: boolean; // 是否显示分类标签（默认 true）
     priorityDisplayStyle?: TaskPriorityDisplayStyle;
     allTasks?: any[]; // All tasks in context (e.g. for subtask progress ratio)
+    taskHierarchy?: TaskHierarchyIndex;
+    visibleTaskHierarchy?: TaskHierarchyIndex;
     customContainerClass?: string; // 自定义容器类名（如 'kanban-task'）
 
     // Managers / Helpers
@@ -79,6 +85,53 @@ export interface TaskRenderCallbacks {
 export class TaskRenderer {
     // 缓存插件资源图片的 blob URL，避免每次渲染都重新异步加载导致闪烁
     private static assetBlobCache = new Map<string, string>();
+    // 所有视图共用一条保存队列，避免多个任务同时写入时相互覆盖。
+    private static customProgressSaveQueue: Promise<void> = Promise.resolve();
+
+    private static saveCustomProgress(task: any, context: TaskRenderContext, percent: number): void {
+        task.customProgress = percent;
+        // 新建任务对话框中的临时子任务尚未落盘，直接修改共享对象即可。
+        if (task.isTempSubtask) return;
+
+        this.customProgressSaveQueue = this.customProgressSaveQueue
+            .catch(() => undefined)
+            .then(async () => {
+                try {
+                    const reminderData = await getAllReminders(context.plugin);
+                    const taskId = task.id || task.instanceId;
+                    const isRepeatInstance = !!(task.isRepeatInstance || task.isRepeatedInstance);
+                    const parsedInstance = isRepeatInstance ? parseReminderInstanceId(taskId) : null;
+                    const originalId = task.originalId || parsedInstance?.originalId;
+                    const instanceDate = getRepeatInstanceOriginalKey(task) || parsedInstance?.instanceDate;
+
+                    if (isRepeatInstance && originalId && instanceDate) {
+                        const originalReminder = reminderData[originalId];
+                        if (!originalReminder) throw new Error(i18n("originalRepeatTaskMissingId", { id: String(originalId) }));
+                        patchRepeatInstanceState(originalReminder, instanceDate, { customProgress: percent });
+                    } else {
+                        const storedTask = reminderData[taskId];
+                        if (!storedTask) throw new Error(i18n("taskMissingId", { id: String(taskId) }));
+                        storedTask.customProgress = percent;
+                        storedTask.updatedAt = new Date().toISOString();
+                    }
+
+                    await saveReminders(context.plugin, reminderData);
+                    if (task.blockId) {
+                        try {
+                            await updateBindBlockAtrrs(task.blockId, context.plugin);
+                        } catch (error) {
+                            console.warn("Failed to sync custom progress to bound block attributes:", task.blockId, error);
+                        }
+                    }
+
+                    window.dispatchEvent(new CustomEvent('reminderUpdated'));
+                } catch (error) {
+                    console.error("Failed to update custom progress:", error);
+                    showMessage(i18n("updateReminderFailed") || "更新任务失败", 3000, "error");
+                    window.dispatchEvent(new CustomEvent('reminderUpdated'));
+                }
+            });
+    }
 
     public static async preloadNoteImages(note: string): Promise<void> {
         if (!note) return;
@@ -93,7 +146,7 @@ export class TaskRenderer {
                     this.assetBlobCache.set(src, URL.createObjectURL(blob));
                 }
             } catch (e) {
-                console.warn('预加载备注图片失败:', src, e);
+                console.warn("Failed to preload note images:", src, e);
             }
         }));
     }
@@ -427,7 +480,7 @@ export class TaskRenderer {
                 }
             }
         } catch (e) {
-            console.warn('格式化 reminderTimes 失败', e);
+            console.warn("Failed to format reminderTimes", e);
         }
 
         return result.trim();
@@ -562,7 +615,11 @@ export class TaskRenderer {
     /**
      * 计算并渲染进度条
      */
-    public static renderProgressBar(task: any, context: TaskRenderContext, infoEl: HTMLElement): void {
+    public static renderProgressBar(
+        task: any,
+        context: TaskRenderContext,
+        infoEl: HTMLElement
+    ): void {
         let percent = 0;
         let shouldShow = false;
 
@@ -571,7 +628,8 @@ export class TaskRenderer {
             shouldShow = true;
             percent = task.completed ? 100 : customPercent;
         } else if (context.allTasks) {
-            const directChildren = context.allTasks.filter((t: any) => t.parentId === task.id);
+            const directChildren = context.taskHierarchy?.children(task.id)
+                ?? context.allTasks.filter((t: any) => t.parentId === task.id);
             if (directChildren.length > 0) {
                 shouldShow = true;
                 const completedCount = directChildren.filter((c: any) => c.completed).length;
@@ -595,7 +653,7 @@ export class TaskRenderer {
             progressBarWrap.className = 'reminder-progress-wrap reminder-item__progress-wrap';
             progressBarWrap.style.cssText = `
                 flex: 1;
-                height: 4px;
+                height: 6px;
                 background-color: var(--b3-theme-surface-lighter);
                 border-radius: 2px;
                 overflow: hidden;
@@ -612,6 +670,30 @@ export class TaskRenderer {
             `;
             progressBarWrap.appendChild(progressBar);
 
+            let customProgressHandle: HTMLSpanElement | null = null;
+            if (customPercent !== undefined) {
+                progressBarWrap.style.position = 'relative';
+                progressBarWrap.style.overflow = 'visible';
+                customProgressHandle = document.createElement('span');
+                customProgressHandle.className = 'reminder-progress-custom-handle';
+                customProgressHandle.style.cssText = `
+                    position: absolute;
+                    top: 50%;
+                    left: clamp(5px, ${percent}%, calc(100% - 5px));
+                    width: 10px;
+                    height: 10px;
+                    box-sizing: border-box;
+                    border: 2px solid var(--b3-theme-primary);
+                    border-radius: 50%;
+                    background-color: var(--b3-theme-background);
+                    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.24);
+                    transform: translate(-50%, -50%);
+                    pointer-events: none;
+                    z-index: 2;
+                `;
+                progressBarWrap.appendChild(customProgressHandle);
+            }
+
             const percentLabel = document.createElement('span');
             percentLabel.className = 'reminder-progress-text reminder-item__progress-text';
             percentLabel.style.cssText = `
@@ -627,6 +709,113 @@ export class TaskRenderer {
             progressContainer.appendChild(progressBarWrap);
             progressContainer.appendChild(percentLabel);
             infoEl.appendChild(progressContainer);
+
+            const canEditCustomProgress = customPercent !== undefined && !task.completed;
+            if (canEditCustomProgress) {
+                progressContainer.classList.add('reminder-progress-container--editable');
+                progressBarWrap.classList.add('reminder-progress-wrap--editable');
+                progressBarWrap.tabIndex = 0;
+                progressBarWrap.setAttribute('role', 'slider');
+                progressBarWrap.setAttribute('aria-valuemin', '0');
+                progressBarWrap.setAttribute('aria-valuemax', '100');
+                progressBarWrap.setAttribute('aria-valuenow', String(percent));
+                progressBarWrap.setAttribute('aria-label', i18n("customProgress") || "自定义进度");
+                progressBarWrap.title = `${i18n("customProgress") || "自定义进度"}：${percent}%`;
+                progressBarWrap.style.cursor = 'ew-resize';
+                progressBarWrap.style.touchAction = 'none';
+
+                let dragging = false;
+                let dragStartPercent = percent;
+
+                const previewProgress = (nextPercent: number) => {
+                    percent = Math.max(0, Math.min(100, Math.round(nextPercent)));
+                    progressBar.style.width = `${percent}%`;
+                    if (customProgressHandle) {
+                        customProgressHandle.style.left = `clamp(5px, ${percent}%, calc(100% - 5px))`;
+                    }
+                    percentLabel.textContent = `${percent}%`;
+                    progressBarWrap.setAttribute('aria-valuenow', String(percent));
+                    progressBarWrap.title = `${i18n("customProgress") || "自定义进度"}：${percent}%`;
+                };
+
+                const previewFromPointer = (event: PointerEvent) => {
+                    const rect = progressBarWrap.getBoundingClientRect();
+                    if (rect.width <= 0) return;
+                    previewProgress(((event.clientX - rect.left) / rect.width) * 100);
+                };
+
+                progressBarWrap.addEventListener('pointerdown', (event: PointerEvent) => {
+                    if (event.button !== 0) return;
+                    event.preventDefault();
+                    event.stopPropagation();
+                    dragging = true;
+                    dragStartPercent = percent;
+                    progressBar.style.transition = 'none';
+                    progressBarWrap.setPointerCapture(event.pointerId);
+                    previewFromPointer(event);
+                });
+
+                progressBarWrap.addEventListener('pointermove', (event: PointerEvent) => {
+                    if (!dragging) return;
+                    event.preventDefault();
+                    event.stopPropagation();
+                    previewFromPointer(event);
+                });
+
+                progressBarWrap.addEventListener('pointerup', (event: PointerEvent) => {
+                    if (!dragging) return;
+                    event.preventDefault();
+                    event.stopPropagation();
+                    previewFromPointer(event);
+                    dragging = false;
+                    progressBar.style.transition = '';
+                    if (progressBarWrap.hasPointerCapture(event.pointerId)) {
+                        progressBarWrap.releasePointerCapture(event.pointerId);
+                    }
+                    if (percent !== dragStartPercent) {
+                        this.saveCustomProgress(task, context, percent);
+                    }
+                });
+
+                progressBarWrap.addEventListener('pointercancel', (event: PointerEvent) => {
+                    if (!dragging) return;
+                    event.stopPropagation();
+                    dragging = false;
+                    progressBar.style.transition = '';
+                    previewProgress(dragStartPercent);
+                });
+
+                progressBarWrap.addEventListener('keydown', (event: KeyboardEvent) => {
+                    let nextPercent: number | undefined;
+                    if (event.key === 'ArrowLeft' || event.key === 'ArrowDown') nextPercent = percent - 1;
+                    if (event.key === 'ArrowRight' || event.key === 'ArrowUp') nextPercent = percent + 1;
+                    if (event.key === 'PageDown') nextPercent = percent - 10;
+                    if (event.key === 'PageUp') nextPercent = percent + 10;
+                    if (event.key === 'Home') nextPercent = 0;
+                    if (event.key === 'End') nextPercent = 100;
+                    if (nextPercent === undefined) return;
+
+                    event.preventDefault();
+                    event.stopPropagation();
+                    const oldPercent = percent;
+                    previewProgress(nextPercent);
+                    if (percent !== oldPercent) {
+                        this.saveCustomProgress(task, context, percent);
+                    }
+                });
+
+                progressBarWrap.addEventListener('click', event => event.stopPropagation());
+                progressBarWrap.addEventListener('dblclick', event => event.stopPropagation());
+                progressBarWrap.addEventListener('dragstart', event => event.preventDefault());
+                progressBarWrap.addEventListener('focus', () => {
+                    progressBarWrap.style.outline = '2px solid var(--b3-theme-primary-light)';
+                    progressBarWrap.style.outlineOffset = '2px';
+                });
+                progressBarWrap.addEventListener('blur', () => {
+                    progressBarWrap.style.outline = '';
+                    progressBarWrap.style.outlineOffset = '';
+                });
+            }
         }
     }
 
@@ -664,10 +853,14 @@ export class TaskRenderer {
         const priority = task.priority || 'none';
 
         // 判断是否有子任务
-        const childrenInVisibleBatch = allVisibleTasks.some(r => r.parentId === task.id);
+        const childrenInVisibleBatch = context.visibleTaskHierarchy
+            ? context.visibleTaskHierarchy.children(task.id).length > 0
+            : allVisibleTasks.some(r => r.parentId === task.id);
         let hasChildren = childrenInVisibleBatch;
         if (!hasChildren && context.allTasks) {
-            hasChildren = context.allTasks.some(r => r.parentId === task.id);
+            hasChildren = context.taskHierarchy
+                ? context.taskHierarchy.children(task.id).length > 0
+                : context.allTasks.some(r => r.parentId === task.id);
         }
 
         // 如果子任务不在当前渲染批次（如侧栏今日视图子任务无今日日期），则视为折叠状态，
@@ -680,7 +873,9 @@ export class TaskRenderer {
 
         // 计算最大深度
         let maxChildDepth = 0;
-        if (hasChildren && allVisibleTasks.length > 0) {
+        if (hasChildren && context.visibleTaskHierarchy) {
+            maxChildDepth = context.visibleTaskHierarchy.maxDescendantDepth(task.id);
+        } else if (hasChildren && allVisibleTasks.length > 0) {
             const calculateDepth = (id: string, currentDepth: number): number => {
                 const children = allVisibleTasks.filter(r => r.parentId === id);
                 if (children.length === 0) return currentDepth;
@@ -812,6 +1007,9 @@ export class TaskRenderer {
         });
         checkbox.addEventListener('change', (e) => {
             e.stopPropagation();
+            if (checkbox.checked && context?.plugin?.playTaskCompleteSound) {
+                context.plugin.playTaskCompleteSound();
+            }
             if (callbacks.onCheckboxClick) {
                 callbacks.onCheckboxClick(task, checkbox.checked, e);
             }
@@ -862,10 +1060,14 @@ export class TaskRenderer {
         }
 
         // 新增：父任务层级路径显示
-        const isParentHidden = task.parentId && !allVisibleTasks.some(r => r.id === task.parentId);
+        const isParentHidden = task.parentId && (context.visibleTaskHierarchy
+            ? !context.visibleTaskHierarchy.byId.has(task.parentId)
+            : !allVisibleTasks.some(r => r.id === task.parentId));
         let isIndependentKanbanSubtask = false;
         if (context.customContainerClass === 'kanban-task' && task.parentId && context.getTaskStatus && context.allTasks) {
-            const parent = context.allTasks.find((t: any) => t.id === task.parentId);
+            const parent = context.taskHierarchy
+                ? context.taskHierarchy.byId.get(task.parentId)
+                : context.allTasks.find((t: any) => t.id === task.parentId);
             if (parent) {
                 const currentStatus = context.getTaskStatus(task);
                 const parentStatus = context.getTaskStatus(parent);
@@ -879,7 +1081,9 @@ export class TaskRenderer {
             const ancestors: string[] = [];
             let currentParentId = task.parentId;
             while (currentParentId) {
-                const parent = context.allTasks.find((t: any) => t.id === currentParentId);
+                const parent = context.taskHierarchy
+                    ? context.taskHierarchy.byId.get(currentParentId)
+                    : context.allTasks.find((t: any) => t.id === currentParentId);
                 if (parent) {
                     ancestors.unshift(parent.title || i18n("unnamedNote"));
                     currentParentId = parent.parentId;
@@ -944,7 +1148,7 @@ export class TaskRenderer {
 
         titleEl.textContent = task.title || i18n("unnamedNote");
         titleEl.classList.add('ariaLabel');
-        titleEl.setAttribute('aria-label', boundBlockId ? `点击打开绑定块: ${task.title || i18n("unnamedNote")}` : (task.title || i18n("unnamedNote")));
+        titleEl.setAttribute('aria-label', boundBlockId ? i18n("openBoundBlockTooltip", { title: String(task.title || i18n("unnamedNote")) }) : (task.title || i18n("unnamedNote")));
         titleRow.appendChild(titleEl);
 
         // 链接 URL 链图标
@@ -987,7 +1191,7 @@ export class TaskRenderer {
             const displayTime = task.date ? task.time : (task.endTime || task.time);
             const timeText = this.formatReminderTime(displayDate, displayTime, today, task.endDate, task.endTime, task, context);
             const hasNoDate = !task.date && !task.endDate;
-            timeEl.textContent = (hasNoDate ? '' : '🗓') + timeText;
+            timeEl.textContent = (hasNoDate ? '' : '🗓️') + timeText;
 
             const isEditable = !task.isSubscribed || (task.subscriptionType === 'caldav' && task.caldavEditable);
             if (isEditable) {
@@ -1043,7 +1247,7 @@ export class TaskRenderer {
                 width: fit-content;
             `;
 
-            const estimatedLine = task.estimatedPomodoroDuration ? `<span class="ariaLabel" aria-label='${i18n('estimatedPomodoro') || "预计番茄"}'>${i18n('estimated') || "预计"}: ${task.estimatedPomodoroDuration}</span>` : '';
+            const estimatedLine = !task.isRepeatInstance && task.estimatedPomodoroDuration ? `<span class="ariaLabel" aria-label='${i18n('estimatedPomodoro') || "预计番茄"}'>${i18n('estimated') || "预计"}: ${task.estimatedPomodoroDuration}</span>` : '';
             let totalLine = '';
             let todayLine = '';
 
@@ -1054,6 +1258,9 @@ export class TaskRenderer {
 
                 const repeatingFocusText = repeatingFocus > 0 ? ` ⏱ ${this.formatMinutesToString(repeatingFocus)}` : '';
                 const instanceFocusText = focusTime > 0 ? ` ⏱ ${this.formatMinutesToString(focusTime)}` : '';
+                const instanceEstimatedText = task.estimatedPomodoroDuration
+                    ? `<span class="ariaLabel" aria-label='${i18n('estimatedPomodoro') || "预计番茄"}'>（${i18n('estimated') || "预计"}：${task.estimatedPomodoroDuration}）</span>`
+                    : '';
 
                 totalLine = `<div style="margin-top:${estimatedLine ? '6px' : '0'}; font-size:12px;">
                     <div class="ariaLabel" aria-label="${i18n('seriesTotalTomatoTitle') || "系列累计番茄钟: "}${repeatingTotal}">
@@ -1062,7 +1269,7 @@ export class TaskRenderer {
                     </div>
                     <div class="ariaLabel" aria-label="${i18n('instanceTomatoTitle') || "本实例番茄钟: "}${instanceCount}" style="margin-top:4px; opacity:0.95;">
                         <span>${i18n('currentInstance') || "本次"}: 🍅 ${instanceCount}</span>
-                        <span style="margin-left:8px; opacity:0.9;">${instanceFocusText}</span>
+                        <span style="margin-left:8px; opacity:0.9;">${instanceFocusText}${instanceEstimatedText}</span>
                     </div>
                  </div>`;
             } else {
@@ -1121,8 +1328,8 @@ export class TaskRenderer {
             }
         } else {
             const currentToday = getLogicalDateString();
-            const canRenderDessertStatus = (context as any).isDailyDessertTaskForDate 
-                ? (context as any).isDailyDessertTaskForDate(task, currentToday) 
+            const canRenderDessertStatus = (context as any).isDailyDessertTaskForDate
+                ? (context as any).isDailyDessertTaskForDate(task, currentToday)
                 : this.isDailyDessertTaskForDate(task, currentToday);
             const canRenderTodayIgnoreStatus = context.canApplyTodayIgnore ? context.canApplyTodayIgnore(task, currentToday) : false;
 
@@ -1157,7 +1364,7 @@ export class TaskRenderer {
                     } catch (e) { }
                     const ignoredEl = document.createElement('div');
                     ignoredEl.className = 'reminder-item__ignored-time';
-                    ignoredEl.textContent = `⭕ 今日已忽略`;
+                    ignoredEl.textContent = i18n("taskIgnoredTodayWithIcon");
                     ignoredEl.style.cssText = 'font-size:12px; margin-top:6px; opacity:0.95;';
                     infoEl.appendChild(ignoredEl);
                 }
@@ -1168,118 +1375,15 @@ export class TaskRenderer {
                 } catch (e) { }
                 const ignoredEl = document.createElement('div');
                 ignoredEl.className = 'reminder-item__ignored-time';
-                ignoredEl.textContent = `⭕ 今日已忽略`;
+                ignoredEl.textContent = i18n("taskIgnoredTodayWithIcon");
                 ignoredEl.style.cssText = 'font-size:12px; margin-top:6px; opacity:0.95;';
                 infoEl.appendChild(ignoredEl);
             }
         }
 
         // 备注信息 (HTML / Markdown)
-        if (task.note) {
-            const noteEl = document.createElement('div');
-            noteEl.className = 'reminder-item__note';
-
-            const lute = context.lute ?? getLuteInstance();
-            if (lute) {
-                noteEl.innerHTML = lute.Md2HTML(task.note);
-                const pTags = noteEl.querySelectorAll('p');
-                pTags.forEach(p => {
-                    p.style.margin = '0';
-                    p.style.lineHeight = 'inherit';
-                });
-                const listTags = noteEl.querySelectorAll('ul, ol');
-                listTags.forEach(list => {
-                    (list as HTMLElement).style.margin = '0';
-                    (list as HTMLElement).style.paddingLeft = '20px';
-                });
-                const liTags = noteEl.querySelectorAll('li');
-                liTags.forEach(li => {
-                    (li as HTMLElement).style.margin = '0';
-                });
-                const quoteTags = noteEl.querySelectorAll('blockquote');
-                quoteTags.forEach(quote => {
-                    (quote as HTMLElement).style.margin = '0';
-                    (quote as HTMLElement).style.paddingLeft = '10px';
-                    (quote as HTMLElement).style.borderLeft = '2px solid var(--b3-theme-on-surface-light)';
-                    (quote as HTMLElement).style.opacity = '0.8';
-                });
-                const imgTags = noteEl.querySelectorAll('img');
-                imgTags.forEach(img => {
-                    // Optimize image display in notes: automatic small thumbnail layout
-                    img.style.setProperty('max-width', '150px', 'important');
-                    img.style.setProperty('max-height', '60px', 'important');
-                    img.style.setProperty('width', 'auto', 'important');
-                    img.style.setProperty('height', 'auto', 'important');
-                    img.style.setProperty('object-fit', 'contain', 'important');
-                    img.style.setProperty('border-radius', '4px', 'important');
-                    img.style.setProperty('display', 'inline-block', 'important');
-                    img.style.setProperty('vertical-align', 'middle', 'important');
-                    img.style.setProperty('margin', '4px 8px 4px 0', 'important');
-                    img.style.setProperty('border', '1px solid var(--b3-border-color)', 'important');
-                    img.style.setProperty('background-color', 'var(--b3-theme-surface)', 'important');
-
-                    // 对屏幕外的图片使用懒加载，减少首次渲染压力
-                    img.loading = 'lazy';
-                    img.decoding = 'async';
-
-                    const src = img.getAttribute('src');
-                    if (src && src.startsWith('/data/storage/petal/siyuan-plugin-task-note-management/assets/')) {
-                        const cachedUrl = TaskRenderer.getAssetBlobUrl(src);
-                        if (cachedUrl) {
-                            img.src = cachedUrl;
-                        } else {
-                            import('../../api').then(({ getFileBlob }) => {
-                                getFileBlob(src).then(blob => {
-                                    if (blob) {
-                                        const url = URL.createObjectURL(blob);
-                                        TaskRenderer.assetBlobCache.set(src, url);
-                                        img.src = url;
-                                    }
-                                });
-                            });
-                        }
-                    }
-                });
-            } else {
-                noteEl.textContent = task.note;
-            }
-
-            noteEl.style.cssText = `
-                font-size: 12px;
-                margin-top: 4px;
-                line-height: 1.5;
-                max-height: 3em;
-                overflow: hidden;
-                display: -webkit-box;
-                -webkit-line-clamp: 2;
-                -webkit-box-orient: vertical;
-                word-break: break-all;
-                cursor: pointer;
-                border-radius: 4px;
-                padding: 0 4px; 
-                margin-left: -4px;
-                transition: background-color 0.2s, color 0.2s;
-                position: relative;
-            `;
-
-            // If the note contains images, adjust container styles to display them completely
-            const hasImages = noteEl.querySelector('img') !== null;
-            if (hasImages) {
-                noteEl.style.maxHeight = 'none';
-                noteEl.style.display = 'block';
-                noteEl.style.webkitLineClamp = 'unset';
-            }
-
-            noteEl.addEventListener('click', (e) => {
-                e.stopPropagation();
-                e.preventDefault();
-                if (callbacks.onNoteClick) {
-                    callbacks.onNoteClick(task, e);
-                }
-            });
-
-            infoEl.appendChild(noteEl);
-        }
+        const noteEl = this.createNoteElement(task, context, callbacks.onNoteClick);
+        if (noteEl) infoEl.appendChild(noteEl);
 
         // 项目名称 (使用预处理的 projectCache)
         const showProjectBadge = context.showProjectBadge !== false;
@@ -1330,7 +1434,7 @@ export class TaskRenderer {
                 projectInfo.appendChild(nameSpan);
 
                 projectInfo.classList.add('ariaLabel');
-                projectInfo.setAttribute('aria-label', `点击打开项目: ${displayProjectName}`);
+                projectInfo.setAttribute('aria-label', i18n("openProjectTooltip", { name: String(displayProjectName) }));
 
                 projectInfo.addEventListener('click', (e) => {
                     e.preventDefault();
@@ -1362,7 +1466,7 @@ export class TaskRenderer {
             const statusColor = kanbanStatusInfo.color || (project ? project.color : '') || 'var(--b3-theme-primary)';
             const projectStatusInfo = document.createElement('div');
             projectStatusInfo.className = 'reminder-item__project-status';
-            
+
             const hasProject = !!project;
             projectStatusInfo.style.cssText = `
                 display: inline-flex;
@@ -1446,9 +1550,9 @@ export class TaskRenderer {
                 cursor: pointer;
                 text-decoration: underline dotted;
             `;
-            habitInfo.textContent = `${habitIcon} 习惯: ${habitName}${modeText}`;
+            habitInfo.textContent = i18n("taskHabitLabel", { icon: String(habitIcon), name: String(habitName), mode: String(modeText) });
             habitInfo.classList.add('ariaLabel');
-            habitInfo.setAttribute('aria-label', `已绑定习惯: ${habitName}${modeText}，点击查看习惯统计`);
+            habitInfo.setAttribute('aria-label', i18n("boundHabitTooltip", { name: String(habitName), mode: String(modeText) }));
 
             habitInfo.addEventListener('click', (e) => {
                 e.preventDefault();
@@ -1599,7 +1703,7 @@ export class TaskRenderer {
 
             (async () => {
                 try {
-                    const { ProjectManager } = await import('../../utils/projectManager');
+                    const { ProjectManager } = await import('../dataManager/projectManager');
                     const projectManager = ProjectManager.getInstance(context.plugin);
                     const projectTags = await projectManager.getProjectTags(task.projectId);
                     const tagMap = new Map(projectTags.map(t => [t.id, t]));
@@ -1628,7 +1732,7 @@ export class TaskRenderer {
                         }
                     });
                 } catch (error) {
-                    console.error('加载项目标签失败:', error);
+                    console.error("Failed to load project tags:", error);
                 }
             })();
 
@@ -1644,6 +1748,94 @@ export class TaskRenderer {
         return taskEl;
     }
 
+
+    /** 与完整卡片共用备注渲染，供侧栏局部更新时保留卡片节点和交互状态。 */
+    public static createNoteElement(task: any, context: TaskRenderContext, onNoteClick?: (task: any, event: Event) => void): HTMLElement | null {
+        if (!task.note) return null;
+        const noteEl = document.createElement('div');
+        noteEl.className = 'reminder-item__note';
+        const lute = context.lute ?? getLuteInstance();
+        if (lute) {
+            noteEl.innerHTML = lute.Md2HTML(task.note);
+            noteEl.querySelectorAll('p').forEach(p => {
+                p.style.margin = '0';
+                p.style.lineHeight = 'inherit';
+            });
+            noteEl.querySelectorAll<HTMLElement>('ul, ol').forEach(list => {
+                list.style.margin = '0';
+                list.style.paddingLeft = '20px';
+            });
+            noteEl.querySelectorAll<HTMLElement>('li').forEach(li => li.style.margin = '0');
+            noteEl.querySelectorAll<HTMLElement>('blockquote').forEach(quote => {
+                quote.style.margin = '0';
+                quote.style.paddingLeft = '10px';
+                quote.style.borderLeft = '2px solid var(--b3-theme-on-surface-light)';
+                quote.style.opacity = '0.8';
+            });
+            noteEl.querySelectorAll('img').forEach(img => {
+                img.style.setProperty('max-width', '150px', 'important');
+                img.style.setProperty('max-height', '60px', 'important');
+                img.style.setProperty('width', 'auto', 'important');
+                img.style.setProperty('height', 'auto', 'important');
+                img.style.setProperty('object-fit', 'contain', 'important');
+                img.style.setProperty('border-radius', '4px', 'important');
+                img.style.setProperty('display', 'inline-block', 'important');
+                img.style.setProperty('vertical-align', 'middle', 'important');
+                img.style.setProperty('margin', '4px 8px 4px 0', 'important');
+                img.style.setProperty('border', '1px solid var(--b3-border-color)', 'important');
+                img.style.setProperty('background-color', 'var(--b3-theme-surface)', 'important');
+                img.loading = 'lazy';
+                img.decoding = 'async';
+                const src = img.getAttribute('src');
+                if (src && src.startsWith('/data/storage/petal/siyuan-plugin-task-note-management/assets/')) {
+                    const cachedUrl = TaskRenderer.getAssetBlobUrl(src);
+                    if (cachedUrl) {
+                        img.src = cachedUrl;
+                    } else {
+                        import('../../api').then(({ getFileBlob }) => {
+                            getFileBlob(src).then(blob => {
+                                if (blob) {
+                                    const url = URL.createObjectURL(blob);
+                                    TaskRenderer.assetBlobCache.set(src, url);
+                                    img.src = url;
+                                }
+                            });
+                        });
+                    }
+                }
+            });
+        } else {
+            noteEl.textContent = task.note;
+        }
+        noteEl.style.cssText = `
+            font-size: 12px;
+            margin-top: 4px;
+            line-height: 1.5;
+            max-height: 3em;
+            overflow: hidden;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            word-break: break-all;
+            cursor: pointer;
+            border-radius: 4px;
+            padding: 0 4px;
+            margin-left: -4px;
+            transition: background-color 0.2s, color 0.2s;
+            position: relative;
+        `;
+        if (noteEl.querySelector('img')) {
+            noteEl.style.maxHeight = 'none';
+            noteEl.style.display = 'block';
+            noteEl.style.webkitLineClamp = 'unset';
+        }
+        noteEl.addEventListener('click', event => {
+            event.stopPropagation();
+            event.preventDefault();
+            onNoteClick?.(task, event);
+        });
+        return noteEl;
+    }
 
     private static getReminderTimeEntries(reminder: any): Array<{ time: string; endTime?: string; note?: string; everyDay?: boolean; overrides?: any }> {
         const entries: Array<{ time: string; endTime?: string; note?: string; everyDay?: boolean; overrides?: any }> = [];

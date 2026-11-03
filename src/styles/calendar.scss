@@ -65,6 +65,13 @@
             --fc-page-bg-color: var(--b3-theme-background);
             --fc-today-bg-color: var(--b3-theme-primary-lightest);
 
+            // FullCalendar 将多天任务挂在起始日期单元格内，再延伸到后续日期。
+            // 其他插件的全局 .fc-daygrid-day { overflow: hidden } 会裁掉跨天部分；
+            // 在本插件范围内恢复可见溢出，兼容月/年视图及时间视图的全天区域。
+            .fc-daygrid-day {
+                overflow: visible;
+            }
+
             /* Today highlight fix */
             .fc-today-custom:not(.fc-popover),
             .fc-list-day-today-custom,
@@ -520,6 +527,21 @@
             }
 
             /* Pomodoro Event Styles */
+            .pomodoro-daily-summary-event {
+                border: none !important;
+                border-radius: 3px;
+                box-shadow: none !important;
+                cursor: default;
+
+                .pomodoro-daily-summary-content {
+                    padding: 3px 4px;
+                    font-weight: 600;
+                    white-space: nowrap;
+                    overflow: hidden;
+                    text-overflow: ellipsis;
+                }
+            }
+
             .pomodoro-event {
                 border: none !important;
                 border-left: none !important;
@@ -761,6 +783,18 @@
     .calendar-collapse-drag-handle:hover {
         transform: scale(1.2) !important;
         filter: brightness(1.15) !important;
+    }
+
+    /* 原生折叠条（fork 版 FullCalendar 渲染的隐藏时段提示条） */
+    .fc-timegrid-hidden-bar {
+        background-color: var(--b3-theme-surface-lighter);
+        color: var(--b3-theme-on-surface-light);
+        transition: background-color 0.15s;
+    }
+
+    .fc-timegrid-hidden-bar:hover {
+        background-color: var(--b3-list-hover);
+        opacity: 1;
     }
 }
 

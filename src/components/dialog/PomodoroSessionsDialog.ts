@@ -1,0 +1,1190 @@
+/*
+ * Copyright (c) 2024 by frostime. All Rights Reserved.
+ * @Author       : frostime
+ * @Date         : 2026-01-10
+ * @FilePath     : /src/components/PomodoroSessionsDialog.ts
+ * @LastEditTime : 2026-01-10
+ * @Description  : 番茄钟会话管理对话框，用于查看、编辑、删除和补录番茄钟记录
+ */
+
+import { Dialog, Menu, confirm, showMessage } from "siyuan";
+import { PomodoroTimer } from "../panel/PomodoroTimer";
+import { PomodoroManager } from "../dataManager/pomodoroManager";
+import { createPomodoroStartSubmenu } from "../../utils/pomodoroPresets";
+import { PomodoroRecordManager, PomodoroSession } from "../dataManager/pomodoroRecord";
+import { i18n } from "../../pluginInstance";
+import { getLocaleTag } from "../../utils/dateUtils";
+import { getBlockByID, getBlockAttrs, setBlockAttrs } from "../../api";
+
+const BLOCK_POMODORO_COUNT_ATTR = "custom-task-pomodoro-count";
+const BLOCK_POMODORO_MINUTES_ATTR = "custom-task-pomodoro-minutes";
+
+interface PomodoroSessionsDialogOptions {
+    includeEventIds?: string[];
+    dialogTitle?: string;
+    defaultAddEventId?: string;
+}
+
+export class PomodoroSessionsDialog {
+    private dialog: Dialog;
+    private reminderId: string;
+    private plugin: any;
+    private recordManager: PomodoroRecordManager;
+    private sessions: PomodoroSession[] = [];
+    private showBreakSessions: boolean = false; // 默认隐藏休息记录
+    private onUpdate?: () => void;
+    private includeInstances: boolean; // 是否包含所有实例的番茄钟
+    private includeEventIds: Set<string>;
+    private dialogTitle?: string;
+    private defaultAddEventId: string;
+
+    /**
+     * @param reminderId 任务ID
+     * @param plugin 插件实例
+     * @param onUpdate 更新回调
+     * @param includeInstances 是否包含该任务所有实例的番茄钟（用于"修改全部实例"模式）
+     * @param options 可选参数（额外纳入的 eventId、标题覆写等）
+     */
+    constructor(
+        reminderId: string,
+        plugin: any,
+        onUpdate?: () => void,
+        includeInstances: boolean = false,
+        options?: PomodoroSessionsDialogOptions
+    ) {
+        this.reminderId = reminderId;
+        this.plugin = plugin;
+        this.onUpdate = onUpdate;
+        this.includeInstances = includeInstances;
+        this.includeEventIds = new Set((options?.includeEventIds || []).filter(Boolean));
+        this.includeEventIds.delete(reminderId);
+        this.dialogTitle = options?.dialogTitle;
+        this.defaultAddEventId = String(options?.defaultAddEventId || reminderId || "").trim() || reminderId;
+        this.recordManager = PomodoroRecordManager.getInstance(plugin);
+    }
+
+    /**
+     * 解析事件标题（支持任务与习惯）
+     * 根据 eventId 分流：
+     * 1. eventId 以 "habit" 开头 -> habitData
+     * 2. 其余 -> reminderData（含实例 originalId 回退）
+     * 3. 传入的 fallbackTitle
+     * 4. 默认文案
+     */
+    private async resolveEventTitle(eventId: string, fallbackTitle?: string): Promise<string> {
+        let eventTitle = "";
+        const isHabitEvent = eventId.startsWith("habit");
+
+        if (isHabitEvent) {
+            try {
+                const habitData = await this.plugin.loadHabitData?.();
+                const habit = habitData?.[eventId];
+                eventTitle = habit?.title || "";
+            } catch (error) {
+                console.warn("Failed to parse habit title:", error);
+            }
+        } else {
+            try {
+                const reminderData = await this.plugin.loadReminderData?.();
+                let reminder = reminderData?.[eventId];
+
+                // 兼容重复实例 ID：originalId_YYYY-MM-DD
+                if (!reminder && eventId.includes('_')) {
+                    const parts = eventId.split('_');
+                    const lastPart = parts[parts.length - 1];
+                    if (/^\d{4}-\d{2}-\d{2}$/.test(lastPart)) {
+                        const originalId = parts.slice(0, -1).join('_');
+                        reminder = reminderData?.[originalId];
+                    }
+                }
+
+                eventTitle = reminder?.title || "";
+            } catch (error) {
+                console.warn("Failed to parse reminder title:", error);
+            }
+        }
+
+        if (!eventTitle) {
+            try {
+                const block = await getBlockByID(eventId);
+                const blockContent = String(block?.content || "").replace(/\s+/g, " ").trim();
+                if (blockContent) {
+                    eventTitle = blockContent.slice(0, 80);
+                }
+            } catch (error) {
+                // noop: 非块 ID 场景会进入这里
+            }
+        }
+
+        return eventTitle || fallbackTitle || i18n("unknownTask");
+    }
+
+    public async show() {
+        await this.loadSessions();
+
+        this.dialog = new Dialog({
+            title: this.dialogTitle || ("🍅 " + (i18n("pomodoros") || "番茄钟记录")),
+            content: `
+                <div class="b3-dialog__content" style="display: flex; flex-direction: column; gap: 12px;">
+                    <div class="pomodoro-filters" style="display: flex; justify-content: flex-end; align-items: center;">
+                        <label for="showBreakSessionsToggle" style="display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none;">
+                            <span style="font-size: 13px; color: var(--b3-theme-on-surface);">${i18n("showBreakSessions") || "显示休息记录"}</span>
+                            <input type="checkbox" id="showBreakSessionsToggle" class="b3-switch" ${this.showBreakSessions ? "checked" : ""}>
+                        </label>
+                    </div>
+                    <div id="pomodoroSessionsList" style="flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; min-height: 100px; max-height: 60vh;">
+                        <!-- 番茄钟列表 -->
+                    </div>
+                </div>
+                <div class="b3-dialog__action">
+                    <button id="addPomodoroBtn" class="b3-button b3-button--outline">
+                        <svg class="b3-button__icon"><use xlink:href="#iconAdd"></use></svg>
+                        ${i18n("addPomodoro") || "补录番茄钟"}
+                    </button>
+                    <button id="startPomodoroBtn" class="b3-button b3-button--primary">
+                        <svg class="b3-button__icon"><use xlink:href="#iconPlay"></use></svg>
+                        ${i18n("startPomodoro") || "开始番茄钟"}
+                    </button>
+                    <button id="startCountUpBtn" class="b3-button b3-button--outline">
+                        ⏱️ ${i18n("startCountUp") || "正计时"}
+                    </button>
+                </div>
+            `,
+            width: "600px",
+            destroyCallback: () => {
+                if (this.onUpdate) this.onUpdate();
+            }
+        });
+
+        this.renderSessions();
+        this.bindEvents();
+    }
+
+    /**
+     * 加载该提醒的所有番茄钟会话
+     */
+    private async loadSessions() {
+        await this.recordManager.initialize();
+
+        // 获取所有日期范围内的会话
+        const allSessions: PomodoroSession[] = [];
+
+        // 遍历所有日期的记录
+        for (const date in (this.recordManager as any).records) {
+            const record = (this.recordManager as any).records[date];
+            if (record && record.sessions) {
+                // 筛选出属于当前提醒的会话
+                const eventSessions = record.sessions.filter((session: PomodoroSession) => {
+                    return this.shouldIncludeEventId(session.eventId);
+                });
+                allSessions.push(...eventSessions);
+            }
+        }
+
+        // 按开始时间降序排列（最新的在前）
+        this.sessions = allSessions.sort((a, b) =>
+            new Date(b.startTime).getTime() - new Date(a.startTime).getTime()
+        );
+    }
+
+    private matchesEventId(eventId: string, targetId: string): boolean {
+        if (!eventId || !targetId) return false;
+        if (eventId === targetId) return true;
+        if (!this.includeInstances) return false;
+        if (!eventId.startsWith(targetId + '_')) return false;
+
+        const suffix = eventId.substring(targetId.length + 1);
+        return /^\d{4}-\d{2}-\d{2}$/.test(suffix);
+    }
+
+    private shouldIncludeEventId(eventId: string): boolean {
+        if (this.matchesEventId(eventId, this.reminderId)) {
+            return true;
+        }
+        for (const linkedId of this.includeEventIds) {
+            if (this.matchesEventId(eventId, linkedId)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private getDefaultAddTargetEventId(): string {
+        const normalized = String(this.defaultAddEventId || "").trim();
+        return normalized || this.reminderId;
+    }
+
+    private parsePomodoroMetric(value: any): number {
+        const numericValue = Number(value);
+        if (!Number.isFinite(numericValue) || numericValue <= 0) return 0;
+        return Math.floor(numericValue);
+    }
+
+    private getWorkStatsForEventId(targetEventId: string): { count: number; minutes: number } {
+        let count = 0;
+        let minutes = 0;
+        this.sessions.forEach((session) => {
+            if (session.type !== "work") return;
+            if (!this.matchesEventId(session.eventId, targetEventId)) return;
+            count += this.recordManager.calculateSessionCount(session);
+            minutes += Math.max(0, Math.floor(Number(session.duration) || 0));
+        });
+        return { count, minutes };
+    }
+
+    private async syncBlockPomodoroAttrs(blockId: string, count: number, minutes: number): Promise<boolean> {
+        if (!blockId || !/^\d{14}-[a-zA-Z0-9]{7}$/.test(blockId)) return false;
+        try {
+            const block = await getBlockByID(blockId);
+            if (!block) return false;
+
+            const blockAttrs = await getBlockAttrs(blockId);
+            const currentCount = this.parsePomodoroMetric(blockAttrs?.[BLOCK_POMODORO_COUNT_ATTR]);
+            const currentMinutes = this.parsePomodoroMetric(blockAttrs?.[BLOCK_POMODORO_MINUTES_ATTR]);
+            const nextCount = Math.max(0, Math.floor(Number(count) || 0));
+            const nextMinutes = Math.max(0, Math.floor(Number(minutes) || 0));
+            if (currentCount === nextCount && currentMinutes === nextMinutes) {
+                return false;
+            }
+
+            await setBlockAttrs(blockId, {
+                [BLOCK_POMODORO_COUNT_ATTR]: nextCount > 0 ? String(nextCount) : "",
+                [BLOCK_POMODORO_MINUTES_ATTR]: nextMinutes > 0 ? String(nextMinutes) : "",
+            });
+            return true;
+        } catch (error) {
+            console.warn("Failed to sync block pomodoro attributes:", error);
+            return false;
+        }
+    }
+
+    private renderSessions() {
+        const listEl = this.dialog.element.querySelector("#pomodoroSessionsList") as HTMLElement;
+        if (!listEl) return;
+
+        const displayedSessions = this.showBreakSessions
+            ? this.sessions
+            : this.sessions.filter(session => session.type === "work");
+
+        if (displayedSessions.length === 0) {
+            const emptyText = this.sessions.length === 0
+                ? (i18n("noPomodoros") || "暂无番茄钟记录")
+                : (i18n("noVisiblePomodoros") || "当前已隐藏休息记录");
+
+            listEl.innerHTML = `
+                <div style="text-align: center; color: var(--b3-theme-on-surface-light); padding: 20px;">
+                    ${emptyText}
+                </div>
+            `;
+            return;
+        }
+
+        // 计算统计信息
+        const totalSessions = this.sessions.reduce((sum, s) => {
+            if (s.type === 'work') {
+                return sum + this.recordManager.calculateSessionCount(s);
+            }
+            return sum;
+        }, 0);
+        const totalFocusTime = this.sessions
+            .filter(s => s.type === 'work')
+            .reduce((sum, s) => sum + s.duration, 0);
+
+        listEl.innerHTML = `
+            <div class="pomodoro-stats" style="padding: 12px; background: var(--b3-theme-background-light); border-radius: 6px; margin-bottom: 8px;">
+                <div style="display: flex; justify-content: space-around; flex-wrap: wrap; gap: 8px;">
+                    <div style="text-align: center; min-width: 80px;">
+                        <div style="font-size: 24px; font-weight: bold; color: var(--b3-theme-primary);">${totalSessions}</div>
+                        <div style="font-size: 12px; color: var(--b3-theme-on-surface-light);">${i18n("completedPomodoroCountLabel")}</div>
+                    </div>
+                    <div style="text-align: center; min-width: 80px;">
+                        <div style="font-size: 24px; font-weight: bold; color: var(--b3-theme-primary);">${this.formatDuration(totalFocusTime)}</div>
+                        <div style="font-size: 12px; color: var(--b3-theme-on-surface-light);">${i18n("totalFocusDurationLabel")}</div>
+                    </div>
+                </div>
+            </div>
+            ${displayedSessions.map(session => this.renderSessionItem(session)).join("")}
+        `;
+
+        // 绑定每个会话项的事件
+        listEl.querySelectorAll(".pomodoro-session-item").forEach(item => {
+            const sessionId = item.getAttribute("data-id");
+            const session = this.sessions.find(s => s.id === sessionId);
+
+            item.querySelector(".edit-pomodoro-btn")?.addEventListener("click", (e) => {
+                e.stopPropagation();
+                this.editSession(session);
+            });
+
+            item.querySelector(".delete-pomodoro-btn")?.addEventListener("click", (e) => {
+                e.stopPropagation();
+                this.deleteSession(sessionId);
+            });
+        });
+    }
+
+    private renderSessionItem(session: PomodoroSession): string {
+        const startTime = new Date(session.startTime);
+        const endTime = new Date(session.endTime);
+
+        const dateStr = startTime.toLocaleDateString(getLocaleTag(), {
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit'
+        });
+
+        const startTimeStr = startTime.toLocaleTimeString(getLocaleTag(), {
+            hour: '2-digit',
+            minute: '2-digit'
+        });
+
+        const endTimeStr = endTime.toLocaleTimeString(getLocaleTag(), {
+            hour: '2-digit',
+            minute: '2-digit'
+        });
+
+        const typeIcon = this.getTypeIcon(session.type);
+        const statusBadge = session.inProgress
+            ? `<span style="background: var(--b3-theme-warning); color: var(--b3-theme-on-background); padding: 2px 6px; border-radius: 3px; font-size: 11px;">${i18n("toRecord")}</span>`
+            : (session.completed
+                ? `<span style="background: #4caf50; color: white; padding: 2px 6px; border-radius: 3px; font-size: 11px;">${i18n("pomodoroCompletedBadge")}</span>`
+                : `<span style="background: var(--b3-theme-error); color: white; padding: 2px 6px; border-radius: 3px; font-size: 11px;">${i18n("incomplete")}</span>`);
+        const note = String(session.note || "").trim();
+        const noteHtml = note
+            ? `<div style="font-size: 12px; color: var(--b3-theme-on-surface); background: var(--b3-theme-background-light); padding: 6px 8px; border-radius: 4px; margin-top: 4px; white-space: pre-wrap; word-break: break-word;">${this.escapeHtml(note)}</div>`
+            : "";
+
+        let extraBadges = '';
+        if (session.type === 'work') {
+            const count = this.recordManager.calculateSessionCount(session);
+
+            if (session.isCountUp) {
+                extraBadges += `<span style="background: var(--b3-theme-secondary); color: var(--b3-theme-on-secondary); padding: 2px 6px; border-radius: 3px; font-size: 11px; margin-left: 4px;">${i18n("pomodoroCountUpBadge")}</span>`;
+                if (count > 0) {
+                    extraBadges += `<span style="background: var(--b3-theme-primary-light); color: var(--b3-theme-primary); padding: 2px 6px; border-radius: 3px; font-size: 11px; margin-left: 4px;">🍅 x${count}</span>`;
+                }
+            } else {
+                extraBadges += `<span style="background: var(--b3-theme-primary); color: var(--b3-theme-on-primary); padding: 2px 6px; border-radius: 3px; font-size: 11px; margin-left: 4px;">${i18n("pomodoroCountDownBadge")}</span>`;
+                if (count > 0) {
+                    extraBadges += `<span style="background: var(--b3-theme-primary-light); color: var(--b3-theme-primary); padding: 2px 6px; border-radius: 3px; font-size: 11px; margin-left: 4px;">🍅 x${count}</span>`;
+                }
+            }
+        }
+
+        return `
+            <div class="pomodoro-session-item" data-id="${session.id}" style="
+                display: flex;
+                align-items: center;
+                padding: 12px;
+                background: var(--b3-theme-surface);
+                border: 1px solid var(--b3-theme-border);
+                border-radius: 6px;
+                transition: all 0.2s;
+            ">
+                <div style="flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px;">
+                    <div style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap;">
+                        <span style="font-size: 18px; flex-shrink: 0;">${typeIcon}</span>
+                        <span style="font-weight: 500; min-width: 0; max-width: 200px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" class="ariaLabel" aria-label="${session.eventTitle}">${session.eventTitle}</span>
+                        ${statusBadge}
+                        ${extraBadges}
+                    </div>
+                    <div style="font-size: 12px; color: var(--b3-theme-on-surface-light); display: flex; gap: 12px;">
+                        <span>📅 ${dateStr}</span>
+                        <span>🕐 ${startTimeStr} - ${endTimeStr}</span>
+                        <span>⏱️ ${session.inProgress ? i18n("toRecord") : i18n("durationMinutes", { minutes: String(session.duration) })}</span>
+                    </div>
+                    ${noteHtml}
+                </div>
+                <div style="display: flex; gap: 4px;">
+                    <button class="b3-button b3-button--outline edit-pomodoro-btn ariaLabel" aria-label="${i18n("edit")}" style="padding: 4px 8px;">
+                        <svg class="b3-button__icon"><use xlink:href="#iconEdit"></use></svg>
+                    </button>
+                    <button class="b3-button b3-button--outline delete-pomodoro-btn ariaLabel" aria-label="${i18n("delete")}" style="padding: 4px 8px;">
+                        <svg class="b3-button__icon"><use xlink:href="#iconTrashcan"></use></svg>
+                    </button>
+                </div>
+            </div>
+        `;
+    }
+
+    private getTypeIcon(type: 'work' | 'shortBreak' | 'longBreak'): string {
+        switch (type) {
+            case 'work':
+                return '🍅';
+            case 'shortBreak':
+                return '☕';
+            case 'longBreak':
+                return '🌴';
+            default:
+                return '⏱️';
+        }
+    }
+
+    private formatDuration(minutes: number): string {
+        if (minutes < 60) {
+            return i18n("durationMinutesCompact", { minutes: String(minutes) });
+        }
+        const hours = Math.floor(minutes / 60);
+        const mins = minutes % 60;
+        return mins > 0 ? i18n("durationHoursMinutesCompact", { hours: String(hours), minutes: String(mins) }) : i18n("durationHours", { hours: String(hours) });
+    }
+
+    private escapeHtml(value: any): string {
+        return String(value ?? "")
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#39;");
+    }
+
+    private bindEvents() {
+        const addBtn = this.dialog.element.querySelector("#addPomodoroBtn") as HTMLButtonElement;
+        const startPomodoroBtn = this.dialog.element.querySelector("#startPomodoroBtn") as HTMLButtonElement;
+        const startCountUpBtn = this.dialog.element.querySelector("#startCountUpBtn") as HTMLButtonElement;
+        const showBreakSessionsToggle = this.dialog.element.querySelector("#showBreakSessionsToggle") as HTMLInputElement;
+
+        addBtn?.addEventListener("click", () => {
+            this.addNewSession();
+        });
+
+        startPomodoroBtn?.addEventListener("click", (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            this.showPomodoroStartMenu(e);
+        });
+
+        startCountUpBtn?.addEventListener("click", () => {
+            this._startPomodoroCountUp();
+        });
+
+        showBreakSessionsToggle?.addEventListener("change", () => {
+            this.showBreakSessions = showBreakSessionsToggle.checked;
+            this.renderSessions();
+        });
+    }
+
+    /**
+     * 弹出开始番茄钟子菜单（带默认时长 + 预设列表）
+     */
+    private showPomodoroStartMenu(event: MouseEvent) {
+        const pomodoroDirectStart = this.plugin?.settings?.pomodoroDirectStart;
+        if (pomodoroDirectStart) {
+            this._startPomodoro();
+            return;
+        }
+
+        try {
+            const menu = new Menu("");
+            const source = { id: this.reminderId };
+            const submenuItems = createPomodoroStartSubmenu({
+                source,
+                plugin: this.plugin,
+                startPomodoro: (workDurationOverride?: number) => this._startPomodoro(workDurationOverride)
+            });
+            submenuItems.forEach(item => {
+                if ((item as any).type === 'separator') {
+                    menu.addSeparator();
+                } else {
+                    menu.addItem(item);
+                }
+            });
+            if (event.target instanceof HTMLElement) {
+                const rect = event.target.getBoundingClientRect();
+                menu.open({ x: rect.left, y: rect.bottom + 4 });
+            } else {
+                menu.open({ x: event.clientX, y: event.clientY });
+            }
+        } catch (error) {
+            console.error("Failed to show pomodoro start menu:", error);
+        }
+    }
+
+    /**
+     * 启动番茄钟（倒计时模式），复用 PomodoroManager 逻辑
+     */
+    private async _startPomodoro(workDurationOverride?: number) {
+        if (!this.plugin) {
+            showMessage(i18n("pomodoroUnavailable"));
+            return;
+        }
+
+        const reminder = await this._resolveReminderSource();
+        const settings = await this.plugin.getPomodoroSettings?.() || {};
+        const runtimeSettings = workDurationOverride && workDurationOverride > 0
+            ? { ...settings, workDuration: workDurationOverride }
+            : settings;
+
+        const pomodoroManager = PomodoroManager.getInstance();
+
+        const doStart = (inheritState?: any) => {
+            pomodoroManager.cleanupInactiveTimer();
+            const hasStandaloneWindow = this.plugin?.pomodoroWindowId;
+            if (hasStandaloneWindow && typeof this.plugin.openPomodoroWindow === 'function') {
+                this.plugin.openPomodoroWindow(reminder, runtimeSettings, false, inheritState);
+            } else {
+                pomodoroManager.closeCurrentTimer();
+                const timer = new PomodoroTimer(reminder, runtimeSettings, false, inheritState, this.plugin);
+                pomodoroManager.setCurrentPomodoroTimer(timer);
+                timer.show();
+            }
+        };
+
+        if (pomodoroManager.hasActivePomodoroTimer()) {
+            const currentState = pomodoroManager.getCurrentState();
+            if (currentState.isRunning && !currentState.isPaused) {
+                pomodoroManager.pauseCurrentTimer();
+            }
+            confirm(
+                i18n("switchPomodoro") || "切换番茄钟任务",
+                `${i18n("confirmSwitchPomodoro") || "当前有正在进行的番茄钟，是否切换？选择确定将继承当前进度。"}`,
+                () => doStart(currentState),
+                () => {
+                    if (currentState.isRunning && !currentState.isPaused) {
+                        pomodoroManager.resumeCurrentTimer();
+                    }
+                }
+            );
+        } else {
+            doStart();
+        }
+    }
+
+    /**
+     * 启动番茄钟（正计时模式）
+     */
+    private async _startPomodoroCountUp() {
+        if (!this.plugin) {
+            showMessage(i18n("pomodoroUnavailable"));
+            return;
+        }
+
+        const reminder = await this._resolveReminderSource();
+        const settings = await this.plugin.getPomodoroSettings?.() || {};
+        const pomodoroManager = PomodoroManager.getInstance();
+
+        const doStart = (inheritState?: any) => {
+            pomodoroManager.cleanupInactiveTimer();
+            const hasStandaloneWindow = this.plugin?.pomodoroWindowId;
+            if (hasStandaloneWindow && typeof this.plugin.openPomodoroWindow === 'function') {
+                this.plugin.openPomodoroWindow(reminder, settings, true, inheritState);
+            } else {
+                pomodoroManager.closeCurrentTimer();
+                const timer = new PomodoroTimer(reminder, settings, true, inheritState, this.plugin);
+                pomodoroManager.setCurrentPomodoroTimer(timer);
+                timer.show();
+            }
+            showMessage(i18n("startedCountUp") || "已启动正计时番茄钟", 2000);
+        };
+
+        if (pomodoroManager.hasActivePomodoroTimer()) {
+            const currentState = pomodoroManager.getCurrentState();
+            if (currentState.isRunning && !currentState.isPaused) {
+                pomodoroManager.pauseCurrentTimer();
+            }
+            confirm(
+                i18n("switchPomodoro") || "切换番茄钟任务",
+                `${i18n("confirmSwitchPomodoro") || "当前有正在进行的番茄钟，是否切换？"}`,
+                () => doStart(currentState),
+                () => {
+                    if (currentState.isRunning && !currentState.isPaused) {
+                        pomodoroManager.resumeCurrentTimer();
+                    }
+                }
+            );
+        } else {
+            doStart();
+        }
+    }
+
+    /**
+     * 构建传给 PomodoroTimer 的 reminder 源对象。
+     * 优先返回 reminderData 中的完整对象（含 blockId、isRepeatInstance 等），
+     * 以确保 PomodoroTimer 能正确打开绑定块。
+     * 若找不到则降级为仅含 { id, title } 的精简对象。
+     */
+    private async _resolveReminderSource(): Promise<any> {
+        const eventId = this.getDefaultAddTargetEventId();
+
+        // 1. 优先从 reminderData 取完整对象（含 blockId）
+        try {
+            const reminderData = await this.plugin.loadReminderData?.();
+            if (reminderData?.[eventId]) {
+                return reminderData[eventId];
+            }
+        } catch (_) { /* noop */ }
+
+        // 2. 兼容重复事件实例 ID（格式：originalId_YYYY-MM-DD）
+        if (eventId.includes('_')) {
+            try {
+                const reminderData = await this.plugin.loadReminderData?.();
+                const parts = eventId.split('_');
+                const lastPart = parts[parts.length - 1];
+                if (/^\d{4}-\d{2}-\d{2}$/.test(lastPart)) {
+                    const originalId = parts.slice(0, -1).join('_');
+                    if (reminderData?.[originalId]) {
+                        // 返回实例对象，合并 blockId 等字段
+                        return { ...reminderData[originalId], id: eventId };
+                    }
+                }
+            } catch (_) { /* noop */ }
+        }
+
+        // 3. 尝试习惯数据
+        try {
+            const habitData = await this.plugin.loadHabitData?.();
+            if (habitData?.[eventId]) {
+                return habitData[eventId];
+            }
+        } catch (_) { /* noop */ }
+
+        // 4. 降级：只有 id + title
+        const title = await this.resolveEventTitle(eventId);
+        return { id: eventId, title };
+    }
+
+    /**
+     * 派发更新事件：
+     * - 始终派发 reminderUpdated，确保任务相关视图刷新
+     * - 自动更新受影响的所有子块及文档块在思源数据库中的 custom-task-pomodoro-* 块属性
+     * - 若当前 eventId 对应习惯，则额外派发 habitUpdated，确保习惯面板刷新
+     */
+    private async dispatchUpdateEvents() {
+        window.dispatchEvent(new CustomEvent('reminderUpdated'));
+
+        void this.updateAffectedBlockAttrs();
+
+        try {
+            const habitData = await this.plugin.loadHabitData?.();
+            if (habitData && habitData[this.reminderId]) {
+                window.dispatchEvent(new CustomEvent('habitUpdated'));
+            }
+        } catch (error) {
+            console.warn("Failed to dispatch habit update event:", error);
+        }
+    }
+
+    /**
+     * 更新受影响的块在思源数据库中的 custom-task-pomodoro-* 块属性
+     */
+    private async updateAffectedBlockAttrs() {
+        try {
+            const { updateBindBlockAtrrs } = await import("../../api");
+            const targetIds = new Set<string>();
+
+            if (this.reminderId) targetIds.add(this.reminderId);
+            if (this.includeEventIds) {
+                this.includeEventIds.forEach(id => targetIds.add(id));
+            }
+
+            const getSeriesBaseId = (id: string): string => {
+                const m = id.match(/^(.+)_(\d{4}-\d{2}-\d{2})$/);
+                return m ? m[1] : id;
+            };
+
+            let reminderData: any = null;
+            if (this.plugin && typeof this.plugin.loadReminderData === 'function') {
+                try {
+                    reminderData = await this.plugin.loadReminderData();
+                } catch { /* ignore */ }
+            }
+
+            const blockIdsToUpdate = new Set<string>();
+
+            for (const id of targetIds) {
+                if (!id) continue;
+                const baseId = getSeriesBaseId(id);
+
+                // 候选 1：仅当 baseId 符合思源块 ID 格式时才直接当作块 ID
+                if (/^\d{14}-[a-zA-Z0-9]{7}$/.test(baseId)) {
+                    blockIdsToUpdate.add(baseId);
+                }
+
+                // 候选 2：关联的 reminder.blockId 或 rem.docId
+                if (reminderData) {
+                    const rem = reminderData[baseId] || reminderData[id];
+                    if (rem) {
+                        if (rem.blockId && /^\d{14}-[a-zA-Z0-9]{7}$/.test(rem.blockId)) blockIdsToUpdate.add(rem.blockId);
+                        if (rem.docId && /^\d{14}-[a-zA-Z0-9]{7}$/.test(rem.docId)) blockIdsToUpdate.add(rem.docId);
+                    }
+                }
+            }
+
+            // 对所有提取出来的受影响块 ID 执行 updateBindBlockAtrrs
+            for (const blockId of blockIdsToUpdate) {
+                if (!blockId) continue;
+                try {
+                    await updateBindBlockAtrrs(blockId, this.plugin);
+                } catch (e) {
+                    console.warn("Failed to update block pomodoro attributes:", blockId, e);
+                }
+            }
+        } catch (err) {
+            console.warn("Exception updating block pomodoro attributes in batch:", err);
+        }
+    }
+
+    /**
+     * 添加新的番茄钟会话（补录）
+     */
+    private async addNewSession() {
+        // 获取插件设置中的番茄钟时长
+        let workDuration = 25;
+        let breakDuration = 5;
+        let longBreakDuration = 15;
+
+        if (this.plugin && typeof this.plugin.loadSettings === 'function') {
+            try {
+                const settings = await this.plugin.loadSettings();
+                workDuration = settings.pomodoroWorkDuration || 25;
+                breakDuration = settings.pomodoroBreakDuration || 5;
+                longBreakDuration = settings.pomodoroLongBreakDuration || 15;
+            } catch (error) {
+                console.warn("Failed to load pomodoro timer settings; using defaults", error);
+            }
+        }
+
+        const addDialog = new Dialog({
+            title: "➕ " + (i18n("addPomodoro") || "补录番茄钟"),
+            content: `
+                <div class="add-pomodoro-dialog" style="padding: 16px;">
+                    <div class="b3-form__group">
+                        <label class="b3-form__label">${i18n("sessionType") || "会话类型"}</label>
+                        <select id="sessionType" class="b3-select" style="width: 100%;">
+                            <option value="work">${i18n("pomodoroWorkType")}</option>
+                            <option value="shortBreak">${i18n("pomodoroShortBreakType")}</option>
+                            <option value="longBreak">${i18n("pomodoroLongBreakType")}</option>
+                        </select>
+                    </div>
+                    <div class="b3-form__group">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; margin-top: 8px;">
+                            <label id="timePointLabel" class="b3-form__label" style="margin: 0;">${i18n("endTime") || "结束时间"}</label>
+                            <select id="timeMode" class="b3-select" style="font-size: 12px; padding: 2px 24px 2px 8px; height: 24px; min-width: 80px;">
+                                <option value="end">${i18n("endTime") || "结束时间"}</option>
+                                <option value="start">${i18n("startTime") || "开始时间"}</option>
+                            </select>
+                        </div>
+                        <input type="datetime-local" id="sessionTimePoint" class="b3-text-field" style="width: 100%;" required>
+                    </div>
+                    <div class="b3-form__group">
+                        <label class="b3-form__label">${i18n("duration") || "持续时长"} (${i18n("minutes") || "分钟"})</label>
+                        <input type="number" id="sessionDuration" class="b3-text-field" value="${workDuration}" min="1" style="width: 100%;" required>
+                    </div>
+                    <div class="b3-form__group" id="countUpGroup">
+                        <label class="b3-checkbox">
+                            <input type="checkbox" id="sessionIsCountUp">
+                            <span class="b3-checkbox__graphic"></span>
+                            <span class="b3-checkbox__label">${i18n("isCountUp") || "正计时 (自动计算番茄数)"}</span>
+                        </label>
+                    </div>
+                    <div class="b3-form__group">
+                        <label class="b3-form__label">${i18n("note") || "备注"}</label>
+                        <textarea id="sessionNote" class="b3-text-field" rows="3" style="width: 100%; resize: vertical;" placeholder="${i18n("pomodoroNotePlaceholder")}"></textarea>
+                    </div>
+                    <div class="b3-dialog__action">
+                        <button class="b3-button b3-button--cancel">${i18n("cancel")}</button>
+                        <button class="b3-button b3-button--primary" id="confirmAddPomodoro">${i18n("save")}</button>
+                    </div>
+                </div>
+            `,
+            width: "400px"
+        });
+
+        // 设置默认时间为当前时间
+        const timeInput = addDialog.element.querySelector("#sessionTimePoint") as HTMLInputElement;
+        const now = new Date();
+        timeInput.value = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}T${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+
+        // 绑定模式切换事件
+        const timeModeSelect = addDialog.element.querySelector("#timeMode") as HTMLSelectElement;
+        const timeLabel = addDialog.element.querySelector("#timePointLabel") as HTMLElement;
+
+        timeModeSelect.addEventListener("change", () => {
+            if (timeModeSelect.value === 'end') {
+                timeLabel.textContent = i18n("endTime") || "结束时间";
+            } else {
+                timeLabel.textContent = i18n("startTime") || "开始时间";
+            }
+        });
+
+        // 类型选择改变时更新默认时长
+        const typeSelect = addDialog.element.querySelector("#sessionType") as HTMLSelectElement;
+        const durationInput = addDialog.element.querySelector("#sessionDuration") as HTMLInputElement;
+        const countUpGroup = addDialog.element.querySelector("#countUpGroup") as HTMLDivElement;
+
+        const isCountUpCheckbox = addDialog.element.querySelector("#sessionIsCountUp") as HTMLInputElement;
+
+        const updateUIState = () => {
+            const isWork = typeSelect.value === 'work';
+            if (isWork) {
+                countUpGroup.style.display = 'block';
+            } else {
+                countUpGroup.style.display = 'none';
+            }
+        };
+        // Initialize
+        updateUIState();
+
+        typeSelect.addEventListener("change", () => {
+            switch (typeSelect.value) {
+                case "work":
+                    durationInput.value = String(workDuration);
+                    break;
+                case "shortBreak":
+                    durationInput.value = String(breakDuration);
+                    break;
+                case "longBreak":
+                    durationInput.value = String(longBreakDuration);
+                    break;
+            }
+            updateUIState();
+        });
+
+        isCountUpCheckbox.addEventListener("change", updateUIState);
+
+        // 取消按钮
+        addDialog.element.querySelector(".b3-button--cancel")?.addEventListener("click", () => {
+            addDialog.destroy();
+        });
+
+        // 确认按钮
+        addDialog.element.querySelector("#confirmAddPomodoro")?.addEventListener("click", async () => {
+            const type = (addDialog.element.querySelector("#sessionType") as HTMLSelectElement).value as 'work' | 'shortBreak' | 'longBreak';
+            const timeMode = (addDialog.element.querySelector("#timeMode") as HTMLSelectElement).value;
+            const timePointStr = (addDialog.element.querySelector("#sessionTimePoint") as HTMLInputElement).value;
+            const duration = parseInt((addDialog.element.querySelector("#sessionDuration") as HTMLInputElement).value);
+            const completed = true; // 强制为已完成
+            const isCountUp = (addDialog.element.querySelector("#sessionIsCountUp") as HTMLInputElement).checked;
+            const note = (addDialog.element.querySelector("#sessionNote") as HTMLTextAreaElement).value.trim();
+
+            if (!timePointStr || !duration || duration <= 0) {
+                showMessage(i18n("pleaseEnterValidInfo") || "请输入有效信息", 3000, "error");
+                return;
+            }
+
+            try {
+                const targetEventId = this.getDefaultAddTargetEventId();
+                const eventTitle = await this.resolveEventTitle(targetEventId);
+
+                // 计算开始和结束时间
+                const timePoint = new Date(timePointStr);
+                let startTime: Date;
+                let endTime: Date;
+
+                if (timeMode === 'end') {
+                    endTime = timePoint;
+                    startTime = new Date(endTime.getTime() - duration * 60000);
+                } else {
+                    startTime = timePoint;
+                    endTime = new Date(startTime.getTime() + duration * 60000);
+                }
+
+                let count = 1;
+                let plannedDuration = duration;
+
+                if (type === 'work' && isCountUp) {
+                    plannedDuration = workDuration; // 正计时模式下，计划时长为单位时长
+                    count = Math.max(1, Math.round(duration / Math.max(1, plannedDuration)));
+                }
+
+                // 创建会话记录
+                const session: PomodoroSession = {
+                    id: Date.now().toString(36) + Math.random().toString(36).substr(2),
+                    type,
+                    eventId: targetEventId,
+                    eventTitle,
+                    startTime: startTime.toISOString(),
+                    endTime: endTime.toISOString(),
+                    duration,
+                    plannedDuration,
+                    completed,
+                    isCountUp,
+                    count,
+                    inProgress: false,
+                    note
+                };
+
+                // 手动添加到记录中
+                const { getLogicalDateString } = await import("../../utils/dateUtils");
+                const logicalDate = getLogicalDateString(startTime);
+
+                // 获取或创建该日期的记录
+                const records = (this.recordManager as any).records;
+                if (!records[logicalDate]) {
+                    records[logicalDate] = {
+                        date: logicalDate,
+                        workSessions: 0,
+                        totalWorkTime: 0,
+                        totalBreakTime: 0,
+                        sessions: []
+                    };
+                }
+
+                // 添加会话
+                records[logicalDate].sessions.push(session);
+
+                // 更新统计
+                if (type === 'work') {
+                    records[logicalDate].workSessions += this.recordManager.calculateSessionCount(session);
+                    records[logicalDate].totalWorkTime += duration;
+                } else {
+                    records[logicalDate].totalBreakTime += duration;
+                }
+
+                // 保存记录
+                await (this.recordManager as any).saveRecords([logicalDate]);
+
+                // 刷新统计索引
+                this.recordManager.refreshIndex();
+
+                showMessage("✅ " + (i18n("addPomodoroSuccess") || "补录番茄钟成功"), 3000, "info");
+
+                addDialog.destroy();
+                await this.loadSessions();
+                await this.syncReminderPomodoroCount();
+                this.renderSessions();
+
+                await this.dispatchUpdateEvents();
+
+                if (this.onUpdate) this.onUpdate();
+            } catch (error) {
+                console.error("Failed to add past pomodoro record:", error);
+                showMessage("❌ " + (i18n("addPomodoroFailed") || "补录番茄钟失败"), 3000, "error");
+            }
+        });
+    }
+
+    /**
+     * 编辑番茄钟会话
+     */
+    private editSession(session: PomodoroSession) {
+        if (!session) return;
+
+        const editDialog = new Dialog({
+            title: "✏️ " + (i18n("editPomodoro") || "编辑番茄钟"),
+            content: `
+                <div class="edit-pomodoro-dialog" style="padding: 16px;">
+                    <div class="b3-form__group">
+                        <label class="b3-form__label">${i18n("sessionType") || "会话类型"}</label>
+                        <select id="editSessionType" class="b3-select" style="width: 100%;">
+                            <option value="work">${i18n("pomodoroWorkType")}</option>
+                            <option value="shortBreak">${i18n("pomodoroShortBreakType")}</option>
+                            <option value="longBreak">${i18n("pomodoroLongBreakType")}</option>
+                        </select>
+                    </div>
+                    <div class="b3-form__group">
+                        <label class="b3-form__label">${i18n("startTime") || "开始时间"}</label>
+                        <input type="datetime-local" id="editSessionStartTime" class="b3-text-field" style="width: 100%;" required>
+                    </div>
+                    <div class="b3-form__group">
+                        <label class="b3-form__label">${i18n("duration") || "持续时长"} (${i18n("minutes") || "分钟"})</label>
+                        <input type="number" id="editSessionDuration" class="b3-text-field" min="1" style="width: 100%;" required>
+                    </div>
+                    <div class="b3-form__group">
+                        <label class="b3-form__label">${i18n("note") || "备注"}</label>
+                        <textarea id="editSessionNote" class="b3-text-field" rows="3" style="width: 100%; resize: vertical;" placeholder="${i18n("pomodoroNotePlaceholder")}">${this.escapeHtml(session.note || "")}</textarea>
+                    </div>
+                    <div class="b3-dialog__action">
+                        <button class="b3-button b3-button--cancel">${i18n("cancel")}</button>
+                        <button class="b3-button b3-button--primary" id="confirmEditPomodoro">${i18n("save")}</button>
+                    </div>
+                </div>
+            `,
+            width: "400px"
+        });
+
+        // 填充当前数据
+        const typeSelect = editDialog.element.querySelector("#editSessionType") as HTMLSelectElement;
+        const startTimeInput = editDialog.element.querySelector("#editSessionStartTime") as HTMLInputElement;
+        const durationInput = editDialog.element.querySelector("#editSessionDuration") as HTMLInputElement;
+        const noteInput = editDialog.element.querySelector("#editSessionNote") as HTMLTextAreaElement;
+
+        typeSelect.value = session.type;
+
+        const startTime = new Date(session.startTime);
+        startTimeInput.value = `${startTime.getFullYear()}-${String(startTime.getMonth() + 1).padStart(2, '0')}-${String(startTime.getDate()).padStart(2, '0')}T${String(startTime.getHours()).padStart(2, '0')}:${String(startTime.getMinutes()).padStart(2, '0')}`;
+
+        const elapsedMinutes = Math.max(1, Math.round((Date.now() - startTime.getTime()) / 60000));
+        durationInput.value = String(session.inProgress && session.duration <= 0 ? elapsedMinutes : session.duration);
+
+        // 取消按钮
+        editDialog.element.querySelector(".b3-button--cancel")?.addEventListener("click", () => {
+            editDialog.destroy();
+        });
+
+        // 确认按钮
+        editDialog.element.querySelector("#confirmEditPomodoro")?.addEventListener("click", async () => {
+            const type = typeSelect.value as 'work' | 'shortBreak' | 'longBreak';
+            const startTimeStr = startTimeInput.value;
+            const duration = parseInt(durationInput.value);
+            const completed = true; // 强制为已完成
+            const note = noteInput.value.trim();
+
+            if (!startTimeStr || !duration || duration <= 0) {
+                showMessage(i18n("pleaseEnterValidInfo") || "请输入有效信息", 3000, "error");
+                return;
+            }
+
+            try {
+                // 先删除旧会话
+                await this.recordManager.deleteSession(session.id);
+
+                // 创建新会话
+                const targetEventId = session.eventId || this.reminderId;
+                const eventTitle = await this.resolveEventTitle(targetEventId, session.eventTitle);
+
+                const startTime = new Date(startTimeStr);
+                const endTime = new Date(startTime.getTime() + duration * 60000);
+
+                const nextPlannedDuration = session.isCountUp
+                    ? Math.max(1, Math.round(Number(session.plannedDuration) || duration))
+                    : duration;
+                const newSession: PomodoroSession = {
+                    id: session.id, // 保持原ID
+                    type,
+                    eventId: targetEventId,
+                    eventTitle,
+                    startTime: startTime.toISOString(),
+                    endTime: endTime.toISOString(),
+                    duration,
+                    plannedDuration: nextPlannedDuration,
+                    completed,
+                    isCountUp: session.isCountUp, // 保留原有的计时属性
+                    count: session.count, // 保留原有的番茄数计数
+                    inProgress: false,
+                    note
+                };
+
+                // 如果修改了时长且是正计时/工作番茄，可能需要重新计算count
+                if (newSession.type === 'work' && newSession.isCountUp && newSession.duration !== session.duration) {
+                    // 简单重新计算：如果有plannedDuration则用，否则假设25
+                    const base = session.plannedDuration || 25;
+                    newSession.count = Math.max(1, Math.round(newSession.duration / Math.max(1, base)));
+                }
+
+                // 添加新会话
+                const { getLogicalDateString } = await import("../../utils/dateUtils");
+                const logicalDate = getLogicalDateString(startTime);
+
+                const records = (this.recordManager as any).records;
+                if (!records[logicalDate]) {
+                    records[logicalDate] = {
+                        date: logicalDate,
+                        workSessions: 0,
+                        totalWorkTime: 0,
+                        totalBreakTime: 0,
+                        sessions: []
+                    };
+                }
+
+                records[logicalDate].sessions.push(newSession);
+
+                if (type === 'work') {
+                    records[logicalDate].workSessions += this.recordManager.calculateSessionCount(newSession);
+                    records[logicalDate].totalWorkTime += duration;
+                } else {
+                    records[logicalDate].totalBreakTime += duration;
+                }
+
+                await (this.recordManager as any).saveRecords([logicalDate]);
+
+                // 刷新统计索引
+                this.recordManager.refreshIndex();
+
+                showMessage("✅ " + (i18n("editPomodoroSuccess") || "修改番茄钟成功"), 3000, "info");
+
+                editDialog.destroy();
+                await this.loadSessions();
+                await this.syncReminderPomodoroCount();
+                this.renderSessions();
+
+                await this.dispatchUpdateEvents();
+
+                if (this.onUpdate) this.onUpdate();
+            } catch (error) {
+                console.error("Failed to modify pomodoro timer:", error);
+                showMessage("❌ " + (i18n("editPomodoroFailed") || "修改番茄钟失败"), 3000, "error");
+            }
+        });
+    }
+
+    /**
+     * 删除番茄钟会话
+     */
+    private async deleteSession(sessionId: string) {
+        const session = this.sessions.find(s => s.id === sessionId);
+        if (!session) return;
+
+        confirm(
+            "⚠️ " + (i18n("confirmDeleteNormal") || "确认删除"),
+            `<div style="padding: 16px;">
+                <p>${i18n("confirmDeletePomodoro") || "确定要删除这个番茄钟记录吗？"}</p>
+                <p style="color: var(--b3-theme-on-surface-light); font-size: 12px;">
+                    ${session.eventTitle} - ${new Date(session.startTime).toLocaleString(getLocaleTag())} (${i18n('durationMinutes', { minutes: String(session.duration) })})
+                </p>
+            </div>`,
+            async (dialog) => {
+                dialog.destroy();
+                try {
+                    const success = await this.recordManager.deleteSession(sessionId);
+
+                    if (success) {
+                        showMessage("✅ " + (i18n("deletePomodoroSuccess") || "删除番茄钟成功"), 3000, "info");
+                        await this.loadSessions();
+                        await this.syncReminderPomodoroCount();
+                        this.renderSessions();
+
+                        await this.dispatchUpdateEvents();
+
+                        if (this.onUpdate) this.onUpdate();
+                    } else {
+                        showMessage("❌ " + (i18n("deletePomodoroFailed") || "删除番茄钟失败"), 3000, "error");
+                    }
+                } catch (error) {
+                    console.error("Failed to delete pomodoro timer:", error);
+                    showMessage("❌ " + (i18n("deletePomodoroFailed") || "删除番茄钟失败"), 3000, "error");
+                }
+            }
+        );
+    }
+
+
+    /**
+     * 同步提醒的番茄钟数量到 reminder.json
+     */
+    private async syncReminderPomodoroCount() {
+        try {
+            const reminderData = await this.plugin.loadReminderData();
+            const targetEventId = this.getDefaultAddTargetEventId();
+            const getSeriesBaseId = (id: string): string => {
+                const m = id.match(/^(.+)_(\d{4}-\d{2}-\d{2})$/);
+                return m ? m[1] : id;
+            };
+            const baseId = getSeriesBaseId(targetEventId);
+            const { count, minutes } = this.getWorkStatsForEventId(targetEventId);
+
+            if (reminderData && (reminderData[baseId] || reminderData[targetEventId])) {
+                const rem = reminderData[baseId] || reminderData[targetEventId];
+                if (rem.pomodoroCount !== count) {
+                    rem.pomodoroCount = count;
+                    await this.plugin.saveReminderData(reminderData);
+                }
+                if (rem.blockId && /^\d{14}-[a-zA-Z0-9]{7}$/.test(rem.blockId)) {
+                    await this.syncBlockPomodoroAttrs(rem.blockId, count, minutes);
+                }
+                return;
+            }
+
+            const habitData = await this.plugin.loadHabitData?.();
+            if (habitData && (habitData[baseId] || habitData[targetEventId])) {
+                return;
+            }
+
+            if (/^\d{14}-[a-zA-Z0-9]{7}$/.test(baseId)) {
+                await this.syncBlockPomodoroAttrs(baseId, count, minutes);
+            }
+        } catch (error) {
+            console.error("Failed to sync pomodoro count:", error);
+        }
+    }
+}

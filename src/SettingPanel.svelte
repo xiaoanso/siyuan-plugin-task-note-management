@@ -3,6 +3,7 @@
     import { Constants, Dialog, confirm } from 'siyuan';
     import Form from '@/libs/components/Form';
     import { i18n } from './pluginInstance';
+    import { EMAIL_PROVIDERS, EMAIL_TRANSPORTS, SMTP_SECURITY_MODES } from './services/emailNotification';
     import {
         DEFAULT_SETTINGS,
         SETTINGS_FILE,
@@ -25,20 +26,21 @@
         resetDoingAndAbandonedTaskListMarkers,
         restoreTaskListMarkers,
     } from './api';
-    import { exportIcsFile, uploadIcsToCloud } from './utils/icsUtils';
+    import { exportIcsFile, uploadIcsToCloud } from './utils/icsExport';
     import { importIcsFile } from './utils/icsImport';
     import { syncHolidays } from './utils/icsSubscription';
-    import { PomodoroManager } from './utils/pomodoroManager';
+    import { PomodoroManager } from './components/dataManager/pomodoroManager';
     import { resolveAudioPath } from './utils/audioUtils';
     import { getGlobalReminderSkipWeekendMode } from './utils/reminderSkipDate';
     import VipPanel from './components/vip/VipPanel.svelte';
-    import SubscriptionPanel from './components/icsSubscriptionPanel.svelte';
-    import HelpPanel from './components/HelpPanel.svelte';
-    import SettingSubGroup from './components/SettingSubGroup.svelte';
-    import { ProjectManager } from './utils/projectManager';
-    import { ProjectSelectorPopup } from './components/ProjectSelectorPopup';
+    import SubscriptionPanel from './components/settings/icsSubscriptionPanel.svelte';
+    import HelpPanel from './components/settings/HelpPanel.svelte';
+    import SettingSubGroup from './components/settings/SettingSubGroup.svelte';
+    import { ProjectManager } from './components/dataManager/projectManager';
+    import { ProjectSelectorPopup } from './components/dialog/ProjectSelectorPopup';
 
     export let plugin;
+    export let initialGroup: string = '';
 
     // 使用从 index.ts 导入的默认设置
     let settings = { ...DEFAULT_SETTINGS };
@@ -90,7 +92,7 @@
                 // Fire-and-forget: save in background without blocking DOM update
                 onChanged({
                     detail: {
-                        group: '🗂️项目设置',
+                        group: '🗂️' + i18n('projectSettings'),
                         key: 'unassignedTasksProjectId',
                         value: projectId,
                     },
@@ -261,7 +263,7 @@
             await pushMsg(i18n('audioDownloadSuccess'));
             return localUrl;
         } catch (e) {
-            console.error('下载音频失败:', e);
+            console.error("Failed to download audio:", e);
             await pushErrMsg(i18n('audioDownloadFailed'));
             return null;
         } finally {
@@ -340,8 +342,8 @@
                 try {
                     return await uploadAudioFile(f);
                 } catch (e) {
-                    console.error('上传音频失败:', f.name, e);
-                    await pushErrMsg(`上传音频失败: ${f.name}`);
+                    console.error("Failed to upload audio:", f.name, e);
+                    await pushErrMsg(i18n("audioFileUploadFailed", { name: String(f.name) }));
                     return null;
                 }
             })
@@ -382,6 +384,7 @@
         pomodoroBreakEndSound: 'breakEndVolume',
         randomRestSounds: 'randomRestVolume',
         randomRestEndSound: 'randomRestEndVolume',
+        taskCompleteSound: 'taskCompleteVolume',
     };
 
     /** 获取音频条目对应的试听音量 */
@@ -516,6 +519,28 @@
                             title: i18n('enableMobileTaskShortcut'),
                             description: i18n('enableMobileTaskShortcutDesc'),
                         },
+                        {
+                            key: 'mobileTaskShortcutBadgeMode',
+                            value: settings.mobileTaskShortcutBadgeMode || 'separate',
+                            type: 'select',
+                            title: i18n('mobileTaskShortcutBadgeMode') || '快捷按钮计数显示方式',
+                            description: i18n('mobileTaskShortcutBadgeModeDesc') || '设置手机端快捷按钮如何显示今日待办任务数与待打卡习惯数',
+                            options: {
+                                merged: i18n('mobileTaskShortcutBadgeMerged') || '合并显示（任务数 + 习惯数）',
+                                separate: i18n('mobileTaskShortcutBadgeSeparate') || '单独显示（任务与习惯两个徽标）',
+                            },
+                        },
+                        {
+                            key: 'mobileTaskShortcutPosition',
+                            value: settings.mobileTaskShortcutPosition || 'right',
+                            type: 'select',
+                            title: i18n('mobileTaskShortcutPosition') || '快捷按钮默认位置',
+                            description: i18n('mobileTaskShortcutPositionDesc') || '设置手机端任务快捷按钮的默认停靠位置（靠右或靠左贴边半显）',
+                            options: {
+                                right: i18n('mobileTaskShortcutPosRight') || '右侧（靠边半显）',
+                                left: i18n('mobileTaskShortcutPosLeft') || '左侧（靠边半显）',
+                            },
+                        },
                     ],
                 },
             ],
@@ -648,12 +673,43 @@
                         },
                         {
                             key: 'reminderSkipHolidays',
-                            value: settings.reminderSkipHolidays,
-                            type: 'checkbox',
+                            value: String(settings.reminderSkipHolidays === true),
+                            type: 'select',
                             title: i18n('reminderSkipHolidays') || '任务提醒跳过节假日',
                             description:
                                 i18n('reminderSkipHolidaysDesc') ||
                                 '仅对重复任务，以及同时横跨节假日和非节假日的跨天任务生效；单个任务可在任务编辑弹窗单独覆盖。',
+                            options: {
+                                true: i18n('reminderSkipHolidaysYes') || '跳过节假日',
+                                false: i18n('reminderSkipWeekendNone') || '不跳过',
+                            },
+                        },
+                    ],
+                },
+                {
+                    name: i18n('subGroupTaskAudio') || '任务与习惯完成音效',
+                    items: [
+                        {
+                            key: 'taskCompleteSoundEnabled',
+                            value: settings.taskCompleteSoundEnabled !== false,
+                            type: 'checkbox',
+                            title: i18n('taskCompleteSoundEnabled') || '开启任务与习惯完成音效',
+                            description: i18n('taskCompleteSoundEnabledDesc') || '勾选完成任务或完成习惯打卡时播放音效提示',
+                        },
+                        {
+                            key: 'taskCompleteVolume',
+                            value: settings.taskCompleteVolume ?? 1,
+                            type: 'slider',
+                            title: i18n('taskCompleteVolume') || '完成音效音量',
+                            description: i18n('taskCompleteVolumeDesc') || '单独设置任务与习惯打卡完成提示音的音量大小，范围0-1',
+                            slider: { min: 0, max: 1, step: 0.1 },
+                        },
+                        {
+                            key: 'taskCompleteSound',
+                            value: settings.audioSelected?.taskCompleteSound || '',
+                            type: 'custom-audio',
+                            title: i18n('taskCompleteSound') || '完成音效',
+                            description: i18n('taskCompleteSoundDesc') || '选择或上传完成任务或习惯打卡时播放的音效文件',
                         },
                     ],
                 },
@@ -744,7 +800,31 @@
                             title: i18n('reminderWebhookEnabled') || '启用 Webhook 通知',
                             description:
                                 i18n('reminderWebhookEnabledDesc') ||
-                                '任务/习惯提醒触发时，向指定 URL 发送 POST JSON 通知。',
+                                '由思源内核后台发送任务、习惯和每日汇总 Webhook，无需打开页面。思源服务需保持运行。',
+                        },
+                        {
+                            key: 'reminderWebhookJsonType',
+                            value: settings.reminderWebhookJsonType,
+                            type: 'select',
+                            title: i18n('reminderWebhookJsonType') || 'Webhook JSON 类型',
+                            description:
+                                i18n('reminderWebhookJsonTypeDesc') ||
+                                '选择预设 JSON 格式；选择自定义时可手动编辑 JSON 请求体。',
+                            options: {
+                                feishu: i18n('webhookJsonTypeFeishu') || '飞书',
+                                wecom: i18n('webhookJsonTypeWecom') || '企业微信',
+                                custom: i18n('webhookJsonTypeCustom') || '自定义',
+                            },
+                        },
+                        {
+                            key: 'reminderWebhookJsonTemplate',
+                            value: settings.reminderWebhookJsonTemplate,
+                            type: 'textarea',
+                            title: i18n('reminderWebhookJsonTemplate') || 'Webhook JSON 格式',
+                            description:
+                                i18n('reminderWebhookJsonTemplateDesc') ||
+                                '选择自定义时生效。变量: ${title} 和 ${message}；清空后使用默认飞书 text 消息格式。',
+                            direction: 'row',
                         },
                         {
                             key: 'reminderWebhookUrl',
@@ -787,7 +867,7 @@
                                             );
                                         }
                                     } catch (error: any) {
-                                        console.error('Webhook测试异常:', error);
+                                        console.error("Webhook test exception:", error);
                                         await pushErrMsg(
                                             (i18n('webhookTestFailed') || 'Webhook 测试失败') +
                                                 ': ' +
@@ -797,29 +877,126 @@
                                 },
                             },
                         },
+                    ],
+                },
+                {
+                    name: i18n('subGroupEmailNotification'),
+                    items: [
                         {
-                            key: 'reminderWebhookJsonType',
-                            value: settings.reminderWebhookJsonType,
+                            key: 'reminderEmailEnabled',
+                            value: settings.reminderEmailEnabled,
+                            type: 'checkbox',
+                            title: i18n('reminderEmailEnabled'),
+                            description: i18n('reminderEmailEnabledDesc'),
+                        },
+                        {
+                            key: 'reminderEmailTransport',
+                            value: settings.reminderEmailTransport,
                             type: 'select',
-                            title: i18n('reminderWebhookJsonType') || 'Webhook JSON 类型',
-                            description:
-                                i18n('reminderWebhookJsonTypeDesc') ||
-                                '选择预设 JSON 格式；选择自定义时可手动编辑 JSON 请求体。',
+                            title: i18n('reminderEmailTransport'),
+                            description: i18n('reminderEmailTransportDesc'),
+                            options: { smtp: i18n('emailTransportSmtp'), api: i18n('emailTransportApi') },
+                        },
+                        {
+                            key: 'reminderEmailSmtpHost',
+                            value: settings.reminderEmailSmtpHost,
+                            type: 'textinput',
+                            title: i18n('reminderEmailSmtpHost'),
+                            description: i18n('reminderEmailSmtpHostDesc'),
+                            placeholder: 'smtp.qq.com',
+                        },
+                        {
+                            key: 'reminderEmailSmtpPort',
+                            value: settings.reminderEmailSmtpPort,
+                            type: 'number',
+                            title: i18n('reminderEmailSmtpPort'),
+                            description: i18n('reminderEmailSmtpPortDesc'),
+                        },
+                        {
+                            key: 'reminderEmailSmtpSecurity',
+                            value: settings.reminderEmailSmtpSecurity,
+                            type: 'select',
+                            title: i18n('reminderEmailSmtpSecurity'),
+                            description: i18n('reminderEmailSmtpSecurityDesc'),
+                            options: { tls: 'SSL/TLS', starttls: 'STARTTLS' },
+                        },
+                        {
+                            key: 'reminderEmailSmtpUser',
+                            value: settings.reminderEmailSmtpUser,
+                            type: 'textinput',
+                            title: i18n('reminderEmailSmtpUser'),
+                            description: i18n('reminderEmailSmtpUserDesc'),
+                        },
+                        {
+                            key: 'reminderEmailSmtpPassword',
+                            value: settings.reminderEmailSmtpPassword,
+                            type: 'password',
+                            title: i18n('reminderEmailSmtpPassword'),
+                            description: i18n('reminderEmailSmtpPasswordDesc'),
+                        },
+                        {
+                            key: 'reminderEmailProvider',
+                            value: settings.reminderEmailProvider,
+                            type: 'select',
+                            title: i18n('reminderEmailProvider'),
+                            description: i18n('reminderEmailProviderDesc'),
                             options: {
-                                feishu: i18n('webhookJsonTypeFeishu') || '飞书',
-                                wecom: i18n('webhookJsonTypeWecom') || '企业微信',
-                                custom: i18n('webhookJsonTypeCustom') || '自定义',
+                                smtp2go: 'SMTP2GO',
+                                resend: 'Resend',
+                                custom: i18n('emailProviderCustom'),
                             },
                         },
                         {
-                            key: 'reminderWebhookJsonTemplate',
-                            value: settings.reminderWebhookJsonTemplate,
-                            type: 'textarea',
-                            title: i18n('reminderWebhookJsonTemplate') || 'Webhook JSON 格式',
-                            description:
-                                i18n('reminderWebhookJsonTemplateDesc') ||
-                                '选择自定义时生效。变量: ${title} 和 ${message}；清空后使用默认飞书 text 消息格式。',
-                            direction: 'row',
+                            key: 'reminderEmailApiUrl',
+                            value: settings.reminderEmailApiUrl,
+                            type: 'textinput',
+                            title: i18n('reminderEmailApiUrl'),
+                            description: i18n('reminderEmailApiUrlDesc'),
+                            placeholder: 'https://example.com/emails',
+                        },
+                        {
+                            key: 'reminderEmailApiKey',
+                            value: settings.reminderEmailApiKey,
+                            type: 'password',
+                            title: i18n('reminderEmailApiKey'),
+                            description: i18n('reminderEmailApiKeyDesc'),
+                        },
+                        {
+                            key: 'reminderEmailFrom',
+                            value: settings.reminderEmailFrom,
+                            type: 'textinput',
+                            title: i18n('reminderEmailFrom'),
+                            description: i18n('reminderEmailFromDesc'),
+                            placeholder: 'sender@example.com',
+                        },
+                        {
+                            key: 'reminderEmailTo',
+                            value: settings.reminderEmailTo,
+                            type: 'textinput',
+                            title: i18n('reminderEmailTo'),
+                            description: i18n('reminderEmailToDesc'),
+                            placeholder: 'recipient@example.com',
+                        },
+                        {
+                            key: 'testEmail',
+                            value: '',
+                            type: 'button',
+                            title: i18n('testEmail'),
+                            description: i18n('testEmailDesc'),
+                            button: {
+                                label: i18n('test'),
+                                callback: async () => {
+                                    await pushMsg(i18n('emailTesting'));
+                                    try {
+                                        await plugin.sendTestEmail(settings);
+                                        await pushMsg(i18n('emailTestSuccess'));
+                                    } catch (error: any) {
+                                        const code = error?.message || 'emailDeliveryFailed';
+                                        const detail = code.startsWith('email') ? i18n(code) : code;
+                                        await pushErrMsg(`${i18n('emailTestFailed')}: ${detail}`);
+                                    }
+                                },
+                            },
                         },
                     ],
                 },
@@ -1034,7 +1211,7 @@
                                 callback: async () => {
                                     try {
                                         const { GlobalProjectStatusDialog } = await import(
-                                            './components/GlobalProjectStatusDialog'
+                                            './components/dialog/GlobalProjectStatusDialog'
                                         );
                                         const dialog = new GlobalProjectStatusDialog(plugin, async () => {
                                             const loadedSettings = await plugin.loadSettings(true);
@@ -1043,7 +1220,7 @@
                                         });
                                         await dialog.show();
                                     } catch (error) {
-                                        console.error('打开全局项目状态配置失败:', error);
+                                        console.error("Failed to open global project status configuration:", error);
                                         await pushErrMsg(
                                             i18n('openModifyDialogFailed') || '打开配置对话框失败'
                                         );
@@ -1200,6 +1377,50 @@
                             title: i18n('enableTaskListStatusSync'),
                             description: i18n('enableTaskListStatusSyncDesc'),
                         },
+                        {
+                            key: 'autoCompleteTaskListChildren',
+                            value: settings.autoCompleteTaskListChildren,
+                            type: 'checkbox',
+                            title: i18n('autoCompleteTaskListChildren'),
+                            description: i18n('autoCompleteTaskListChildrenDesc'),
+                        },
+                    ],
+                },
+                {
+                    name: i18n('taskListSort'),
+                    items: [
+                        {
+                            key: 'enableTaskListSort',
+                            value: settings.enableTaskListSort,
+                            type: 'checkbox',
+                            title: i18n('enableTaskListSort'),
+                            description: i18n('enableTaskListSortDesc'),
+                        },
+                        {
+                            key: 'enableGlobalTaskListAutoSort',
+                            value: settings.enableGlobalTaskListAutoSort,
+                            type: 'checkbox',
+                            title: i18n('enableGlobalTaskListAutoSort'),
+                            description: i18n('enableGlobalTaskListAutoSortDesc'),
+                        },
+                        {
+                            key: 'showTaskListAutoSortMenu',
+                            value: settings.showTaskListAutoSortMenu,
+                            type: 'checkbox',
+                            title: i18n('showTaskListAutoSortMenu'),
+                            description: i18n('showTaskListAutoSortMenuDesc'),
+                        },
+                        {
+                            key: 'taskListSortMenuMode',
+                            value: settings.taskListSortMenuMode,
+                            type: 'select',
+                            title: i18n('taskListSortMenuMode'),
+                            description: i18n('taskListSortMenuModeDesc'),
+                            options: {
+                                bottom: i18n('completedTasksToBottom'),
+                                top: i18n('completedTasksToTop'),
+                            },
+                        },
                     ],
                 },
             ],
@@ -1301,6 +1522,18 @@
                 {
                     name: i18n('subGroupPomodoroStyle'),
                     items: [
+                        {
+                            key: 'pomodoroDefaultWindowMode',
+                            value: settings.pomodoroDefaultWindowMode || 'full',
+                            type: 'select',
+                            title: i18n('pomodoroDefaultWindowMode'),
+                            description: i18n('pomodoroDefaultWindowModeDesc'),
+                            options: {
+                                full: i18n('pomodoroWindowModeFull'),
+                                mini: i18n('pomodoroWindowModeMini'),
+                                docked: i18n('dockMode'),
+                            },
+                        },
                         {
                             key: 'pomodoroDockPosition',
                             value: settings.pomodoroDockPosition,
@@ -1855,7 +2088,7 @@
                                                     await removeFile(dataDir + file);
                                                     successCount++;
                                                 } catch (e) {
-                                                    console.error('删除文件失败:', file, e);
+                                                    console.error("Failed to delete file:", file, e);
                                                 }
                                             }
                                             pushErrMsg(
@@ -1928,7 +2161,7 @@
                                             // 显示批量设置对话框
                                             showImportDialog(content);
                                         } catch (error) {
-                                            console.error('读取文件失败:', error);
+                                            console.error("Failed to read file:", error);
                                             await pushErrMsg(i18n('readFileFailed'));
                                         }
                                     };
@@ -1959,8 +2192,7 @@
                                 <div style="margin-top:12px;">
                                     <img src="plugins/siyuan-plugin-task-note-management/assets/donate.png" alt="donate" style="width:260px; height:auto; border:1px solid var(--b3-border-color);"/>
 
-                                    <p style="margin-top:12px;">Non-Chinese users can transfer money via Wise, Western Union, etc.</p>
-                                    <img src="plugins/siyuan-plugin-task-note-management/assets/Alipay.jpg"alt="donate" style="width:260px; height:auto; border:1px solid var(--b3-border-color);"/>
+                                    <p style="margin-top:12px;">Non-Chinese users can <a href="https://pancake.waffo.ai/store/achuan-2-fdbho4ye/product/PROD_3F7Aa7c2NQlz9KmxcgxjQ7?type=onetime&amp;currency=USD" target="_blank" rel="noopener noreferrer">donate here</a>.</p>
                                 </div>
                             `,
                         },
@@ -1970,7 +2202,7 @@
         },
     ];
 
-    let focusGroup = groups[0].name;
+    let focusGroup = groups.find(group => group.name === initialGroup)?.name || groups[0].name;
     let settingSearchKeyword = '';
 
     interface ChangeEvent {
@@ -2018,7 +2250,7 @@
                 })
             );
         } catch (error) {
-            console.error('同步项目看板显示设置失败:', error);
+            console.error("Failed to sync project kanban display settings:", error);
             await pushErrMsg(
                 i18n('applyProjectKanbanDisplaySettingsFailed') || '同步项目看板显示设置失败'
             );
@@ -2077,7 +2309,7 @@
                     setDayStartTime(settings.todayStartTime);
                     setSingleDateDefaultRole(settings.singleDateDefaultRole);
                 } catch (error) {
-                    console.error('应用默认日期设置失败:', error);
+                    console.error("Failed to apply default date settings:", error);
                 }
 
                 await applyProjectKanbanDisplaySettingsToAllProjects();
@@ -2101,7 +2333,7 @@
             const parsed = parseInt(value, 10);
             newValue = isNaN(parsed) ? 3 : Math.max(1, Math.min(14, parsed));
         } else if (
-            (key === 's3ForcePathStyle' || key === 's3TlsVerify') &&
+            (key === 's3ForcePathStyle' || key === 's3TlsVerify' || key === 'reminderSkipHolidays') &&
             typeof value === 'string'
         ) {
             newValue = value === 'true';
@@ -2146,6 +2378,18 @@
             }
         } else if (key === 'reminderWebhookUrl' && typeof value === 'string') {
             newValue = value.trim();
+        } else if (key === 'reminderEmailProvider') {
+            newValue = EMAIL_PROVIDERS.includes(value) ? value : DEFAULT_SETTINGS.reminderEmailProvider;
+        } else if (key === 'reminderEmailTransport') {
+            newValue = EMAIL_TRANSPORTS.includes(value) ? value : DEFAULT_SETTINGS.reminderEmailTransport;
+        } else if (key === 'reminderEmailSmtpSecurity') {
+            newValue = SMTP_SECURITY_MODES.includes(value) ? value : DEFAULT_SETTINGS.reminderEmailSmtpSecurity;
+        } else if (key === 'reminderEmailSmtpPort') {
+            newValue = Number(value);
+        } else if (key === 'reminderEmailSmtpUser' || key === 'reminderEmailSmtpHost') {
+            newValue = typeof value === 'string' ? value.trim() : '';
+        } else if (['reminderEmailApiUrl', 'reminderEmailApiKey', 'reminderEmailFrom', 'reminderEmailTo'].includes(key)) {
+            newValue = typeof value === 'string' ? value.trim() : '';
         } else if (key === 'reminderWebhookJsonType') {
             newValue = ['feishu', 'wecom', 'custom'].includes(value)
                 ? value
@@ -2176,11 +2420,11 @@
                 try {
                     const { setDayStartTime } = await import('./utils/dateUtils');
                     setDayStartTime(newValue as string);
-                    const { PomodoroRecordManager } = await import('./utils/pomodoroRecord');
+                    const { PomodoroRecordManager } = await import('./components/dataManager/pomodoroRecord');
                     const recordManager = PomodoroRecordManager.getInstance(plugin);
                     await recordManager.regenerateRecordsByDate();
                 } catch (error) {
-                    console.error('重新生成番茄钟记录失败:', error);
+                    console.error("Failed to regenerate pomodoro records:", error);
                 }
             })();
         }
@@ -2191,7 +2435,7 @@
                     const { setSingleDateDefaultRole } = await import('./utils/dateUtils');
                     setSingleDateDefaultRole(newValue as string);
                 } catch (error) {
-                    console.error('更新单日期默认识别设置失败:', error);
+                    console.error("Failed to update single-date recognition default:", error);
                 }
             })();
         }
@@ -2215,7 +2459,7 @@
                     const pomodoroSettings = await plugin.getPomodoroSettings(settings);
                     await PomodoroManager.getInstance().updateSettings(pomodoroSettings);
                 } catch (error) {
-                    console.error('更新番茄钟设置失败:', error);
+                    console.error("Failed to update pomodoro timer settings:", error);
                 }
             })();
         }
@@ -2242,7 +2486,7 @@
                         }
                     }
                 } catch (error) {
-                    console.error('同步任务列表状态失败:', error);
+                    console.error("Failed to sync task list state:", error);
                 }
             })();
         }
@@ -2327,7 +2571,7 @@
                 name: notebook.name,
             }));
         } catch (error) {
-            console.error('加载笔记本列表失败:', error);
+            console.error("Failed to load notebook list:", error);
             notebooks = [];
         }
     }
@@ -2341,7 +2585,7 @@
                 name: project.name || project.id,
             }));
         } catch (error) {
-            console.error('加载项目列表失败:', error);
+            console.error("Failed to load project list:", error);
             projectsList = [];
         }
     }
@@ -2369,7 +2613,7 @@
         await ensureDefaultNotebookSelected(true);
         loadProjectsList();
         updateGroupItems();
-        console.debug('加载配置文件完成');
+        console.debug("Configuration file loaded");
     }
 
     function updateGroupItems() {
@@ -2478,6 +2722,15 @@
             if (item.key === 'reminderWebhookJsonTemplate') {
                 updated.hidden = settings.reminderWebhookJsonType !== 'custom';
             }
+            if (item.key === 'reminderEmailApiUrl') {
+                updated.hidden = settings.reminderEmailTransport !== 'api' || settings.reminderEmailProvider !== 'custom';
+            }
+            if (['reminderEmailProvider', 'reminderEmailApiKey'].includes(item.key)) {
+                updated.hidden = settings.reminderEmailTransport !== 'api';
+            }
+            if (item.key.startsWith('reminderEmailSmtp')) {
+                updated.hidden = settings.reminderEmailTransport !== 'smtp';
+            }
 
             return updated;
         };
@@ -2541,22 +2794,22 @@
     // ICS导入对话框
     async function showImportDialog(icsContent: string) {
         // 加载项目和标签数据
-        const { ProjectManager } = await import('./utils/projectManager');
+        const { ProjectManager } = await import('./components/dataManager/projectManager');
         const projectManager = ProjectManager.getInstance(plugin);
         await projectManager.initialize();
         const groupedProjects = projectManager.getProjectsGroupedByStatus();
 
         const dialog = new Dialog({
-            title: '导入 ICS 文件',
+            title: i18n("importIcs"),
             content: `
                 <div class="b3-dialog__content" style="padding: 16px;">
                     <div class="fn__flex-column" style="gap: 16px;">
                         <div class="b3-label">
-                            <div class="b3-label__text">批量设置所属项目（可选）</div>
+                            <div class="b3-label__text">${i18n("icsImportProjectOptional")}</div>
                             <div class="fn__hr"></div>
                             <div style="display: flex; gap: 8px;">
                                 <select class="b3-select fn__flex-1" id="import-project-select">
-                                    <option value="">不设置</option>
+                                    <option value="">${i18n("doNotSet")}</option>
                                     ${Object.entries(groupedProjects)
                                         .map(([statusId, statusProjects]) => {
                                             if (statusProjects.length === 0) return '';
@@ -2580,14 +2833,14 @@
                                         })
                                         .join('')}
                                 </select>
-                                <button class="b3-button b3-button--outline" id="import-create-project" title="新建项目">
+                                <button class="b3-button b3-button--outline" id="import-create-project" title="${i18n('newProject')}">
                                     <svg class="b3-button__icon"><use xlink:href="#iconAdd"></use></svg>
                                 </button>
                             </div>
                         </div>
                         
                         <div class="b3-label">
-                            <div class="b3-label__text">批量设置分类（可选）</div>
+                            <div class="b3-label__text">${i18n("icsImportCategoryOptional")}</div>
                             <div class="fn__hr"></div>
                             <div id="import-category-selector" class="category-selector" style="display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px;">
                                 <!-- 分类选择器将在这里渲染 -->
@@ -2595,22 +2848,22 @@
                         </div>
                         
                         <div class="b3-label">
-                            <div class="b3-label__text">批量设置优先级（可选）</div>
+                            <div class="b3-label__text">${i18n("icsImportPriorityOptional")}</div>
                             <div class="fn__hr"></div>
                             <select class="b3-select fn__flex-1" id="import-priority">
-                                <option value="">不设置</option>
-                                <option value="high">高优先级</option>
-                                <option value="medium">中优先级</option>
-                                <option value="low">低优先级</option>
-                                <option value="none">无优先级</option>
+                                <option value="">${i18n("doNotSet")}</option>
+                                <option value="high">${i18n("high")}</option>
+                                <option value="medium">${i18n("medium")}</option>
+                                <option value="low">${i18n("low")}</option>
+                                <option value="none">${i18n("noPriority")}</option>
                             </select>
                         </div>
                         
                         <div class="fn__hr"></div>
                         
                         <div class="fn__flex" style="justify-content: flex-end; gap: 8px;">
-                            <button class="b3-button b3-button--cancel">取消</button>
-                            <button class="b3-button b3-button--text" id="import-confirm">导入</button>
+                            <button class="b3-button b3-button--cancel">${i18n("cancel")}</button>
+                            <button class="b3-button b3-button--text" id="import-confirm">${i18n("importSettings")}</button>
                         </div>
                     </div>
                 </div>
@@ -2637,7 +2890,7 @@
             if (!categorySelector) return;
 
             try {
-                const { CategoryManager } = await import('./utils/categoryManager');
+                const { CategoryManager } = await import('./components/dataManager/categoryManager');
                 const categoryManager = CategoryManager.getInstance(plugin);
                 await categoryManager.initialize();
                 const categories = categoryManager.getCategories();
@@ -2649,7 +2902,7 @@
                 const noCategoryEl = document.createElement('div');
                 noCategoryEl.className = 'category-option';
                 noCategoryEl.setAttribute('data-category', '');
-                noCategoryEl.textContent = '无分类';
+                noCategoryEl.textContent = i18n("noCategory");
                 noCategoryEl.style.cssText = `
                     display: inline-flex;
                     align-items: center;
@@ -2738,8 +2991,8 @@
                     });
                 });
             } catch (error) {
-                console.error('加载分类失败:', error);
-                categorySelector.innerHTML = '<div class="category-error">加载分类失败</div>';
+                console.error("Failed to load categories:", error);
+                categorySelector.innerHTML = `<div class="category-error">${i18n("loadCategoriesFailed")}</div>`;
             }
         }
 
@@ -2750,7 +3003,7 @@
         createProjectBtn.addEventListener('click', async () => {
             try {
                 // 使用 ProjectDialog 创建项目
-                const { ProjectDialog } = await import('./components/ProjectDialog');
+                const { ProjectDialog } = await import('./components/dialog/ProjectDialog');
                 const projectDialog = new ProjectDialog(undefined, plugin);
                 await projectDialog.show();
 
@@ -2761,7 +3014,7 @@
                     const groupedProjects = projectManager.getProjectsGroupedByStatus();
 
                     // 清空并重新填充下拉列表
-                    projectSelect.innerHTML = '<option value="">不设置</option>';
+                    projectSelect.innerHTML = `<option value="">${i18n("doNotSet")}</option>`;
                     Object.entries(groupedProjects).forEach(([statusId, statusProjects]) => {
                         if (statusProjects.length === 0) return;
                         const status = projectManager.getStatusManager().getStatusById(statusId);
@@ -2791,8 +3044,8 @@
 
                 window.addEventListener('projectUpdated', handleProjectCreated as EventListener);
             } catch (error) {
-                console.error('创建项目失败:', error);
-                await pushErrMsg('创建项目失败');
+                console.error("Failed to create project:", error);
+                await pushErrMsg(i18n("createProjectFailed"));
             }
         });
 
@@ -2811,7 +3064,7 @@
                 });
                 dialog.destroy();
             } catch (error) {
-                console.error('导入失败:', error);
+                console.error("Import failed:", error);
             }
         });
 
@@ -2828,7 +3081,7 @@
             <input
                 class="b3-text-field config__search-input"
                 type="search"
-                placeholder="搜索设置项..."
+                placeholder={i18n('searchSettingsPlaceholder')}
                 bind:value={settingSearchKeyword}
             />
         </div>
@@ -2851,7 +3104,7 @@
     </div>
     <div class="config__tab-wrap">
         {#if visibleGroups.length === 0}
-            <div class="config__search-empty">未找到匹配的设置项</div>
+            <div class="config__search-empty">{i18n('noMatchingSettings')}</div>
         {:else}
             <!-- 手动按项目顺序渲染，保证 custom-audio 项在正确位置 -->
             <div class="config__tab-container" data-name={currentGroup?.name || ''}>

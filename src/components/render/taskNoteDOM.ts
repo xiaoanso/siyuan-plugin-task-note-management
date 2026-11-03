@@ -1,12 +1,20 @@
 import { showMessage } from "siyuan";
 import { i18n } from "../../pluginInstance";
-import { PomodoroRecordManager } from "../../utils/pomodoroRecord";
-import { ProjectManager, type MilestoneDateDisplayInfo } from "../../utils/projectManager";
+import { PomodoroRecordManager } from "../dataManager/pomodoroRecord";
+import { ProjectManager, type MilestoneDateDisplayInfo } from "../dataManager/projectManager";
 
 const PROJECT_KANBAN_TAB_TYPE = "TN_project_kanban_tab";
 const BLOCK_POMODORO_COUNT_ATTR = "custom-task-pomodoro-count";
 const BLOCK_POMODORO_MINUTES_ATTR = "custom-task-pomodoro-minutes";
+const TRACKED_BLOCK_ATTRS = [
+    "custom-task-projectid", "custom-bind-reminders", "custom-bind-milestones",
+    BLOCK_POMODORO_COUNT_ATTR, BLOCK_POMODORO_MINUTES_ATTR,
+];
+const TRACKED_BLOCK_SELECTOR = TRACKED_BLOCK_ATTRS.map(name => `[${name}]`).join(", ");
+const BUTTON_STRUCTURE_SELECTOR = `${TRACKED_BLOCK_SELECTOR}, .protyle-attr, .protyle-title, .protyle-wysiwyg, [data-plugin-added="reminder-plugin"]`;
 const INSTANCE_EVENT_ID_SUFFIX_REGEX = /^(.*)_\d{4}-\d{2}-\d{2}$/;
+const OUTLINE_PREFIX_DATA_ATTR = "data-task-note-outline-prefix";
+const OUTLINE_PREFIX_OWNED_ATTR = "data-task-note-outline-prefix-owned";
 
 interface PomodoroStats {
     count: number;
@@ -23,9 +31,10 @@ export class TaskNoteDOMManager {
     private plugin: any;
 
     private processingBlockButtons: Set<string> = new Set();
-    private outlinePrefixCache: Map<string, string> = new Map();
-    private protyleObservers: WeakMap<Element, MutationObserver> = new WeakMap();
-    private protyleDebounceTimers: WeakMap<Element, number> = new WeakMap();
+    private outlinePrefixCache: Map<string, string | null> = new Map();
+    private protyleObservers: Map<Element, MutationObserver> = new Map();
+    private protyleDebounceTimers: Map<Element, number> = new Map();
+    private disposed = false;
     private currentHeadingIds: Set<string> = new Set();
     private pomodoroStatsByEventId: Map<string, PomodoroStats> = new Map();
     private pomodoroStatsByBaseEventId: Map<string, PomodoroStats> = new Map();
@@ -38,22 +47,44 @@ export class TaskNoteDOMManager {
     private lastMilestoneDateDisplayByBlock: Map<string, MilestoneDateDisplayInfo> = new Map();
     private dialogPreloadTimer: number | null = null;
     private dialogsPreloaded = false;
+    private blockRootIdCache: Map<string, string> = new Map();
+    private docPomodoroSummaryCache: Map<string, {
+        count: number;
+        minutes: number;
+        includeEventIds: string[];
+        cacheVersion: number;
+    }> = new Map();
 
     constructor(plugin: any) {
         this.plugin = plugin;
         const onReminderUpdated = () => {
             this.invalidatePomodoroStatsCache();
-            this.refreshBoundReminderDateButtonsForAllProtyles();
+        };
+        const onProtyleDestroyed = (event: CustomEvent) => {
+            const element = event.detail?.protyle?.element;
+            if (element) this.releaseProtyle(element);
         };
         window.addEventListener("reminderUpdated", onReminderUpdated as EventListener);
+        this.plugin.eventBus.on("destroy-protyle", onProtyleDestroyed);
         this.scheduleDialogPreload();
         this.plugin.addCleanup(() => {
+            this.disposed = true;
             window.removeEventListener("reminderUpdated", onReminderUpdated as EventListener);
+            this.plugin.eventBus.off("destroy-protyle", onProtyleDestroyed);
+            for (const element of this.protyleObservers.keys()) this.releaseProtyle(element);
             if (this.dialogPreloadTimer) {
                 window.clearTimeout(this.dialogPreloadTimer);
                 this.dialogPreloadTimer = null;
             }
         });
+    }
+
+    private releaseProtyle(element: Element) {
+        this.protyleObservers.get(element)?.disconnect();
+        this.protyleObservers.delete(element);
+        const timer = this.protyleDebounceTimers.get(element);
+        if (timer !== undefined) window.clearTimeout(timer);
+        this.protyleDebounceTimers.delete(element);
     }
 
     private scheduleDialogPreload() {
@@ -68,8 +99,8 @@ export class TaskNoteDOMManager {
         if (this.dialogsPreloaded) return;
         this.dialogsPreloaded = true;
         void Promise.allSettled([
-            import("../BlockRemindersDialog"),
-            import("../PomodoroSessionsDialog"),
+            import("../dialog/BlockRemindersDialog"),
+            import("../dialog/PomodoroSessionsDialog"),
         ]);
     }
 
@@ -85,9 +116,7 @@ export class TaskNoteDOMManager {
     }
 
     private shouldIgnoreMutation(mutation: MutationRecord): boolean {
-        if (mutation.type === "attributes") {
-            return this.isPluginManagedNode(mutation.target);
-        }
+        if (this.isPluginManagedNode(mutation.target)) return true;
         if (mutation.type === "childList") {
             const changedNodes = [...Array.from(mutation.addedNodes), ...Array.from(mutation.removedNodes)];
             if (changedNodes.length === 0) return false;
@@ -96,12 +125,29 @@ export class TaskNoteDOMManager {
         return false;
     }
 
-    private refreshBoundReminderDateButtonsForAllProtyles() {
-        document.querySelectorAll(".protyle").forEach((protyleElement) => {
-            const protyle = (protyleElement as any).protyle;
-            if (!protyle?.element) return;
-            this._scanProtyleForButtons(protyle);
-        });
+    private mutationAffectsBlockButtons(mutation: MutationRecord): boolean {
+        if (this.shouldIgnoreMutation(mutation)) return false;
+        if (mutation.type === "attributes") {
+            return TRACKED_BLOCK_ATTRS.includes(mutation.attributeName || "") &&
+                mutation.oldValue !== (mutation.target as Element).getAttribute(mutation.attributeName!);
+        }
+        if (mutation.type !== "childList") return false;
+        // 正文文字、行内样式和光标变化无需扫描整篇文档；只关心绑定属性或按钮容器的增删。
+        const affectsStructure = (node: Node) => node instanceof Element &&
+            (node.matches(BUTTON_STRUCTURE_SELECTOR) || !!node.querySelector(BUTTON_STRUCTURE_SELECTOR));
+        return Array.from(mutation.addedNodes).some(affectsStructure) ||
+            Array.from(mutation.removedNodes).some(affectsStructure);
+    }
+
+    public isProtyleVisible(protyle: any): boolean {
+        if (this.disposed || !protyle || !protyle.element) return false;
+        const element = protyle.element as HTMLElement;
+        if (!element.isConnected) return false;
+        if (element.closest(".fn__none")) return false;
+        if (element.offsetWidth === 0 && element.offsetHeight === 0) return false;
+        const style = window.getComputedStyle(element);
+        if (style.display === "none" || style.visibility === "hidden") return false;
+        return true;
     }
 
     private parsePomodoroMetric(value?: string | null): number {
@@ -159,12 +205,11 @@ export class TaskNoteDOMManager {
         this.pomodoroStatsByBaseEventId = new Map();
         this.pomodoroStatsCacheUpdatedAt = 0;
         this.pomodoroStatsLoadingPromise = null;
+        this.docPomodoroSummaryCache.clear();
     }
 
     private async ensurePomodoroStatsCache(force = false): Promise<void> {
-        const cacheTtlMs = 3000;
-        const now = Date.now();
-        if (!force && this.pomodoroStatsCacheUpdatedAt > 0 && now - this.pomodoroStatsCacheUpdatedAt < cacheTtlMs) {
+        if (!force && this.pomodoroStatsCacheUpdatedAt > 0) {
             return;
         }
         if (this.pomodoroStatsLoadingPromise) {
@@ -206,7 +251,7 @@ export class TaskNoteDOMManager {
                 this.pomodoroStatsByBaseEventId = statsByBaseEventId;
                 this.pomodoroStatsCacheUpdatedAt = Date.now();
             } catch (error) {
-                console.warn("加载番茄会话缓存失败:", error);
+                console.warn("Failed to load pomodoro session cache:", error);
                 this.pomodoroStatsByEventId = new Map();
                 this.pomodoroStatsByBaseEventId = new Map();
                 this.pomodoroStatsCacheUpdatedAt = Date.now();
@@ -262,22 +307,132 @@ export class TaskNoteDOMManager {
         return { count: attrCount, minutes: attrMinutes };
     }
 
+    private isUpdatingOutlineDOM = false;
+    private outlineFetchPromise: Promise<void> | null = null;
+    private outlineRefreshPending = false;
+    private outlineForceRefreshPending = false;
+
+    private clearAppliedOutlinePrefixes() {
+        const outline = document.querySelector(".file-tree.sy__outline");
+        if (!outline) return;
+
+        this.isUpdatingOutlineDOM = true;
+        try {
+            outline.querySelectorAll(`.b3-list-item__text[${OUTLINE_PREFIX_DATA_ATTR}]`).forEach((element) => {
+                const textElement = element as HTMLElement;
+                const appliedPrefix = textElement.getAttribute(OUTLINE_PREFIX_DATA_ATTR) || "";
+                const isOwnedPrefix = textElement.hasAttribute(OUTLINE_PREFIX_OWNED_ATTR);
+                const currentText = textElement.textContent || "";
+                if (isOwnedPrefix && appliedPrefix && currentText.startsWith(appliedPrefix)) {
+                    textElement.textContent = currentText.slice(appliedPrefix.length);
+                }
+                textElement.removeAttribute(OUTLINE_PREFIX_DATA_ATTR);
+                textElement.removeAttribute(OUTLINE_PREFIX_OWNED_ATTR);
+            });
+        } finally {
+            this.isUpdatingOutlineDOM = false;
+        }
+    }
+
+    public applyCachedOutlinePrefixes(): { hasUncachedBlocks: boolean } {
+        if (this.isUpdatingOutlineDOM) {
+            return { hasUncachedBlocks: false };
+        }
+
+        if (this.plugin.settings?.enableOutlinePrefix === false) {
+            this.clearAppliedOutlinePrefixes();
+            this.outlinePrefixCache.clear();
+            this.currentHeadingIds.clear();
+            return { hasUncachedBlocks: false };
+        }
+
+        const outline = document.querySelector(".file-tree.sy__outline");
+        if (!outline) return { hasUncachedBlocks: false };
+
+        const headingLis = outline.querySelectorAll("li[data-type=\"NodeHeading\"]");
+        if (headingLis.length === 0) return { hasUncachedBlocks: false };
+
+        let hasUncachedBlocks = false;
+        const currentBlockIds: string[] = [];
+
+        this.isUpdatingOutlineDOM = true;
+        try {
+            headingLis.forEach((li) => {
+                const blockId = (li as HTMLElement).getAttribute("data-node-id");
+                if (!blockId) return;
+
+                currentBlockIds.push(blockId);
+
+                if (!this.outlinePrefixCache.has(blockId)) {
+                    hasUncachedBlocks = true;
+                    return;
+                }
+
+                const prefix = this.outlinePrefixCache.get(blockId);
+                const textElement = li.querySelector(".b3-list-item__text") as HTMLElement;
+                if (!textElement) return;
+
+                const currentText = textElement.textContent || "";
+                const appliedPrefix = textElement.getAttribute(OUTLINE_PREFIX_DATA_ATTR) || "";
+                const isOwnedPrefix = textElement.hasAttribute(OUTLINE_PREFIX_OWNED_ATTR);
+                const textWithoutAppliedPrefix = isOwnedPrefix && appliedPrefix && currentText.startsWith(appliedPrefix)
+                    ? currentText.slice(appliedPrefix.length)
+                    : currentText;
+
+                let targetText = textWithoutAppliedPrefix;
+                let ownsTargetPrefix = false;
+                if (prefix) {
+                    // 兼容升级前已写入 DOM、但尚未带标记的前缀，避免重复添加。
+                    targetText = !isOwnedPrefix && currentText.startsWith(prefix)
+                        ? currentText
+                        : prefix + textWithoutAppliedPrefix;
+                    ownsTargetPrefix = targetText !== textWithoutAppliedPrefix;
+                }
+
+                if (currentText !== targetText) {
+                    textElement.textContent = targetText;
+                }
+                if (prefix) {
+                    textElement.setAttribute(OUTLINE_PREFIX_DATA_ATTR, prefix);
+                    if (ownsTargetPrefix) {
+                        textElement.setAttribute(OUTLINE_PREFIX_OWNED_ATTR, "true");
+                    } else {
+                        textElement.removeAttribute(OUTLINE_PREFIX_OWNED_ATTR);
+                    }
+                } else {
+                    textElement.removeAttribute(OUTLINE_PREFIX_DATA_ATTR);
+                    textElement.removeAttribute(OUTLINE_PREFIX_OWNED_ATTR);
+                }
+            });
+        } finally {
+            this.isUpdatingOutlineDOM = false;
+        }
+
+        if (currentBlockIds.length > 0) {
+            this.currentHeadingIds = new Set(currentBlockIds);
+        }
+
+        return { hasUncachedBlocks };
+    }
+
     public initOutlinePrefixObserver() {
         let updateTimeout: number | null = null;
         let lastObservedElement: Element | null = null;
         let currentObserver: MutationObserver | null = null;
 
-        const debouncedUpdate = () => {
+        const debouncedFullUpdate = (delay = 200) => {
             if (updateTimeout) clearTimeout(updateTimeout);
             updateTimeout = window.setTimeout(() => {
                 const outline = document.querySelector(".file-tree.sy__outline");
                 if (!outline) return;
-                this.updateOutlinePrefixes();
-            }, 0);
+                void this.updateOutlinePrefixes();
+            }, delay);
         };
 
         const createObserver = (element: Element) => {
             const observer = new MutationObserver((mutations) => {
+                if (this.isUpdatingOutlineDOM) return;
+
                 const hasSignificantChange = mutations.some((mutation) => {
                     if (mutation.type === "childList") {
                         return mutation.addedNodes.length > 0 || mutation.removedNodes.length > 0;
@@ -290,7 +445,13 @@ export class TaskNoteDOMManager {
                     }
                     return false;
                 });
-                if (hasSignificantChange) debouncedUpdate();
+
+                if (hasSignificantChange) {
+                    const { hasUncachedBlocks } = this.applyCachedOutlinePrefixes();
+                    if (hasUncachedBlocks) {
+                        debouncedFullUpdate(250);
+                    }
+                }
             });
 
             observer.observe(element, {
@@ -306,7 +467,7 @@ export class TaskNoteDOMManager {
         const wsMainHandler = (event: CustomEvent) => {
             const data = event.detail;
             if (data?.cmd === "setAppearance") {
-                debouncedUpdate();
+                debouncedFullUpdate(50);
                 return;
             }
             if (data?.cmd === "transactions" && data.data) {
@@ -322,16 +483,17 @@ export class TaskNoteDOMManager {
                                 if (op.data && "bookmark" in op.data && !op.data.new) {
                                     hasBookmarkUpdate = true;
                                 }
-                                if (hasBookmarkUpdate && this.currentHeadingIds.has(op.id)) {
-                                    shouldUpdate = true;
-                                    break;
+                                if (hasBookmarkUpdate) {
+                                    this.outlinePrefixCache.delete(op.id);
+                                    if (this.currentHeadingIds.has(op.id)) {
+                                        shouldUpdate = true;
+                                    }
                                 }
                             }
                         }
                     }
-                    if (shouldUpdate) break;
                 }
-                if (shouldUpdate) debouncedUpdate();
+                if (shouldUpdate) debouncedFullUpdate(50);
             }
         };
 
@@ -346,19 +508,22 @@ export class TaskNoteDOMManager {
                 lastObservedElement = outlineContainer;
                 if (outlineContainer) {
                     currentObserver = createObserver(outlineContainer);
-                    debouncedUpdate();
+                    const { hasUncachedBlocks } = this.applyCachedOutlinePrefixes();
+                    if (hasUncachedBlocks) debouncedFullUpdate(100);
                 }
             }
         }, 2000);
 
-        setTimeout(() => {
+        const initialOutlineTimer = setTimeout(() => {
             const outlineContainer = document.querySelector(".file-tree.sy__outline");
             if (outlineContainer && !currentObserver) {
                 lastObservedElement = outlineContainer;
                 currentObserver = createObserver(outlineContainer);
-                debouncedUpdate();
+                const { hasUncachedBlocks } = this.applyCachedOutlinePrefixes();
+                if (hasUncachedBlocks) debouncedFullUpdate(100);
             } else if (outlineContainer) {
-                debouncedUpdate();
+                const { hasUncachedBlocks } = this.applyCachedOutlinePrefixes();
+                if (hasUncachedBlocks) debouncedFullUpdate(100);
             }
         }, 500);
 
@@ -366,6 +531,7 @@ export class TaskNoteDOMManager {
             if (currentObserver) currentObserver.disconnect();
             this.plugin.eventBus.off("ws-main", wsMainHandler);
             clearInterval(checkInterval);
+            clearTimeout(initialOutlineTimer);
             if (updateTimeout) clearTimeout(updateTimeout);
         });
     }
@@ -373,17 +539,22 @@ export class TaskNoteDOMManager {
     public addBreadcrumbButtonsToExistingProtyles() {
         document.querySelectorAll(".protyle").forEach((protyleElement) => {
             const protyle = (protyleElement as any).protyle;
-            if (protyle) {
+            if (protyle && this.isProtyleVisible(protyle)) {
                 this.addBreadcrumbReminderButton(protyle);
                 this.addBlockProjectButtonsToProtyle(protyle);
             }
         });
     }
 
-    public async updateOutlinePrefixes() {
+    private async performOutlinePrefixUpdate(force: boolean) {
         try {
-            const settings = await this.plugin.loadSettings();
-            if (!settings.enableOutlinePrefix) return;
+            const settings = this.plugin.settings || await this.plugin.loadSettings();
+            if (!settings?.enableOutlinePrefix) {
+                this.clearAppliedOutlinePrefixes();
+                this.outlinePrefixCache.clear();
+                this.currentHeadingIds.clear();
+                return;
+            }
 
             const outline = document.querySelector(".file-tree.sy__outline");
             if (!outline) return;
@@ -392,78 +563,85 @@ export class TaskNoteDOMManager {
             if (headingLis.length === 0) return;
 
             const blockIds: string[] = [];
-            const liMap = new Map<string, HTMLElement>();
             headingLis.forEach((li) => {
                 const blockId = (li as HTMLElement).getAttribute("data-node-id");
-                if (blockId) {
-                    blockIds.push(blockId);
-                    liMap.set(blockId, li as HTMLElement);
-                }
+                if (blockId) blockIds.push(blockId);
             });
 
             if (blockIds.length === 0) return;
 
             this.currentHeadingIds = new Set(blockIds);
 
-            const { sql } = await import("../../api");
-            const idsStr = blockIds.map((id) => `'${id}'`).join(",");
-            const sqlQuery = `SELECT block_id, value FROM attributes WHERE block_id IN (${idsStr}) AND name = 'bookmark' LIMIT -1`;
-            const attrsResults = await sql(sqlQuery);
+            if (force) {
+                blockIds.forEach((id) => this.outlinePrefixCache.delete(id));
+            }
 
-            const bookmarkMap = new Map<string, string>();
-            if (attrsResults && Array.isArray(attrsResults)) {
-                attrsResults.forEach((row: any) => {
-                    bookmarkMap.set(row.block_id, row.value || "");
+            const uncachedIds = blockIds.filter((id) => !this.outlinePrefixCache.has(id));
+
+            if (uncachedIds.length > 0) {
+                const { sql } = await import("../../api");
+                const idsStr = uncachedIds.map((id) => `'${id}'`).join(",");
+                const sqlQuery = `SELECT block_id, value FROM attributes WHERE block_id IN (${idsStr}) AND name = 'bookmark' LIMIT -1`;
+                const attrsResults = await sql(sqlQuery);
+
+                const bookmarkMap = new Map<string, string>();
+                if (attrsResults && Array.isArray(attrsResults)) {
+                    attrsResults.forEach((row: any) => {
+                        bookmarkMap.set(row.block_id, row.value || "");
+                    });
+                }
+
+                uncachedIds.forEach((blockId) => {
+                    const bookmark = bookmarkMap.get(blockId);
+                    let prefix: string | null = null;
+                    if (bookmark === "✅") {
+                        prefix = "✅ ";
+                    } else if (bookmark === "⏰") {
+                        prefix = "⏰ ";
+                    }
+                    this.outlinePrefixCache.set(blockId, prefix);
                 });
             }
 
-            blockIds.forEach((blockId) => {
-                const li = liMap.get(blockId);
-                if (!li) return;
+            const { hasUncachedBlocks } = this.applyCachedOutlinePrefixes();
+            if (hasUncachedBlocks) {
+                // SQL 返回期间大纲可能已切换；确保再按最新 DOM 补刷一次。
+                this.outlineRefreshPending = true;
+            }
 
-                const textElement = li.querySelector(".b3-list-item__text") as HTMLElement;
-                if (!textElement) return;
-
-                const hasAttribute = bookmarkMap.has(blockId);
-                const isManaged = this.outlinePrefixCache.has(blockId);
-
-                if (!hasAttribute && !isManaged) {
-                    return;
-                }
-
-                const bookmark = hasAttribute ? (bookmarkMap.get(blockId) || "") : "";
-
-                let prefix = "";
-                if (bookmark === "✅") {
-                    prefix = "✅ ";
-                } else if (bookmark === "⏰") {
-                    prefix = "⏰ ";
-                }
-
-                if (!hasAttribute) {
-                    this.outlinePrefixCache.delete(blockId);
-                } else {
-                    this.outlinePrefixCache.set(blockId, prefix);
-                }
-
-                const currentText = textElement.textContent || "";
-                const textWithoutPrefix = currentText.replace(/^[✅⏰]\s*/, "");
-                const targetText = prefix + textWithoutPrefix;
-
-                if (currentText !== targetText) {
-                    textElement.textContent = targetText;
-                }
-            });
-
-            const currentBlockIdSet = new Set(blockIds);
             for (const cachedId of this.outlinePrefixCache.keys()) {
-                if (!currentBlockIdSet.has(cachedId)) {
+                if (!this.currentHeadingIds.has(cachedId)) {
                     this.outlinePrefixCache.delete(cachedId);
                 }
             }
         } catch (error) {
-            console.error("[大纲前缀] 更新失败:", error);
+            console.error("[OutlinePrefix] Update failed:", error);
         }
+    }
+
+    public async updateOutlinePrefixes(force = false) {
+        this.outlineRefreshPending = true;
+        if (force) this.outlineForceRefreshPending = true;
+
+        if (this.outlineFetchPromise) {
+            await this.outlineFetchPromise;
+            return;
+        }
+
+        this.outlineFetchPromise = (async () => {
+            try {
+                while (this.outlineRefreshPending) {
+                    const shouldForce = this.outlineForceRefreshPending;
+                    this.outlineRefreshPending = false;
+                    this.outlineForceRefreshPending = false;
+                    await this.performOutlinePrefixUpdate(shouldForce);
+                }
+            } finally {
+                this.outlineFetchPromise = null;
+            }
+        })();
+
+        await this.outlineFetchPromise;
     }
 
     public async addBreadcrumbReminderButton(protyle: any) {
@@ -581,13 +759,16 @@ export class TaskNoteDOMManager {
         };
 
         if (!rawAttr && !hasBind && !rawMilestones && pomodoroTotalCount <= 0 && pomodoroTotalMinutes <= 0) {
-            const trackedSource = this._findTrackedSourceForBlock(protyle, blockId);
-            if (trackedSource && trackedSource !== attrSource) return;
-            const btns = protyle.element.querySelectorAll(`[data-block-id="${blockId}"][data-plugin-added="reminder-plugin"]`);
-            if (btns.length > 0) {
-                btns.forEach((b: Element) => b.remove());
+            // 文档块即使自身没有数据，也需要继续处理（由异步方法扫描子块后决定是否显示）
+            if (!isDocumentLevel) {
+                const trackedSource = this._findTrackedSourceForBlock(protyle, blockId);
+                if (trackedSource && trackedSource !== attrSource) return;
+                const btns = protyle.element.querySelectorAll(`[data-block-id="${blockId}"][data-plugin-added="reminder-plugin"]`);
+                if (btns.length > 0) {
+                    btns.forEach((b: Element) => b.remove());
+                }
+                return;
             }
-            return;
         }
 
         if (this.processingBlockButtons.has(blockId)) return;
@@ -602,15 +783,10 @@ export class TaskNoteDOMManager {
 
     public _scanProtyleForButtons(protyle: any) {
         try {
-            if (!protyle || !protyle.element) return;
+            if (!protyle || !protyle.element || !this.isProtyleVisible(protyle)) return;
 
             const selector = `[custom-task-projectid], [custom-bind-reminders], [custom-bind-milestones], [${BLOCK_POMODORO_COUNT_ATTR}], [${BLOCK_POMODORO_MINUTES_ATTR}]`;
             const allBlocks = Array.from(protyle.element.querySelectorAll(selector)) as Element[];
-
-            if (allBlocks.length === 0) {
-                this._cleanupOrphanedButtons(protyle);
-                return;
-            }
 
             const blocksToProcess = new Map<string, {
                 projectIds: string[];
@@ -666,6 +842,26 @@ export class TaskNoteDOMManager {
                 }
             }
 
+            // 文档块始终加入处理队列（即使自身无属性，也需通过异步扫描子块来显示/清除番茄按钮）
+            const wysiwyg = protyle.element.querySelector(".protyle-wysiwyg") as HTMLElement | null;
+            const docBlockId = wysiwyg ? (wysiwyg.getAttribute("data-node-id") || this._getBlockIdFromElement(wysiwyg)) : null;
+            if (docBlockId && wysiwyg && !blocksToProcess.has(docBlockId)) {
+                blocksToProcess.set(docBlockId, {
+                    projectIds: [],
+                    hasBind: false,
+                    bindReminderIds: [],
+                    milestoneIds: [],
+                    pomodoroTotalCount: 0,
+                    pomodoroTotalMinutes: 0,
+                    element: wysiwyg,
+                });
+            }
+
+            if (blocksToProcess.size === 0) {
+                this._cleanupOrphanedButtons(protyle);
+                return;
+            }
+
             this._cleanupOrphanedButtons(protyle, blocksToProcess);
 
             for (const [blockId, info] of blocksToProcess) {
@@ -678,49 +874,19 @@ export class TaskNoteDOMManager {
                 }
             }
         } catch (error) {
-            console.error("扫描块按钮失败:", error);
+            console.error("Failed to scan block buttons:", error);
         }
     }
 
+
     public async addBlockProjectButtonsToProtyle(protyle: any) {
-        if (!protyle || !protyle.element) return;
+        if (!protyle || !protyle.element || !this.isProtyleVisible(protyle)) return;
 
         this._scanProtyleForButtons(protyle);
 
         if (!this.protyleObservers.has(protyle.element)) {
             const observer = new MutationObserver((mutations) => {
-                let shouldUpdate = false;
-                for (const mutation of mutations) {
-                    if (this.shouldIgnoreMutation(mutation)) {
-                        continue;
-                    }
-                    if (mutation.type === "attributes") {
-                        shouldUpdate = true;
-                        const target = mutation.target as Element;
-                        this._processSingleBlock(protyle, target);
-                    } else if (mutation.type === "childList") {
-                        if (mutation.addedNodes.length > 0) {
-                            shouldUpdate = true;
-                            mutation.addedNodes.forEach((node) => {
-                                if (node.nodeType === 1) {
-                                    const el = node as Element;
-                                    this._processSingleBlock(protyle, el);
-                                    const relevantChildren = el.querySelectorAll?.(
-                                        `[custom-task-projectid], [custom-bind-reminders], [custom-bind-milestones], [${BLOCK_POMODORO_COUNT_ATTR}], [${BLOCK_POMODORO_MINUTES_ATTR}]`
-                                    );
-                                    if (relevantChildren && relevantChildren.length > 0) {
-                                        relevantChildren.forEach((child) => this._processSingleBlock(protyle, child));
-                                    }
-                                }
-                            });
-                        }
-                        if (mutation.removedNodes.length > 0) {
-                            shouldUpdate = true;
-                        }
-                    }
-                }
-
-                if (shouldUpdate) {
+                if (mutations.some(mutation => this.mutationAffectsBlockButtons(mutation))) {
                     const element = protyle.element;
                     const existingTimer = this.protyleDebounceTimers.get(element);
                     if (existingTimer) {
@@ -728,8 +894,10 @@ export class TaskNoteDOMManager {
                     }
 
                     const timer = window.setTimeout(() => {
+                        this.protyleDebounceTimers.delete(element);
+                        if (!this.isProtyleVisible(protyle)) return;
                         this._scanProtyleForButtons(protyle);
-                    }, 50);
+                    }, 100);
 
                     this.protyleDebounceTimers.set(element, timer);
                 }
@@ -739,40 +907,11 @@ export class TaskNoteDOMManager {
                 childList: true,
                 subtree: true,
                 attributes: true,
-                attributeFilter: [
-                    "custom-task-projectid",
-                    "custom-bind-reminders",
-                    "custom-bind-milestones",
-                    BLOCK_POMODORO_COUNT_ATTR,
-                    BLOCK_POMODORO_MINUTES_ATTR,
-                    "updated",
-                    "bookmark",
-                ],
-            });
-
-            const attrObserver = new MutationObserver((mutations) => {
-                for (const m of mutations) {
-                    if (this.shouldIgnoreMutation(m)) {
-                        continue;
-                    }
-                    if (m.target instanceof Element && m.target.classList.contains("protyle-attr")) {
-                        const block = m.target.closest("[data-node-id]");
-                        if (block) this._processSingleBlock(protyle, block);
-                    }
-                }
-            });
-            attrObserver.observe(protyle.element, {
-                childList: true,
-                subtree: true,
+                attributeOldValue: true,
+                attributeFilter: TRACKED_BLOCK_ATTRS,
             });
 
             this.protyleObservers.set(protyle.element, observer);
-
-            this.plugin.addCleanup(() => {
-                observer.disconnect();
-                attrObserver.disconnect();
-                this.protyleObservers.delete(protyle.element);
-            });
         }
     }
 
@@ -945,14 +1084,17 @@ export class TaskNoteDOMManager {
         pomodoroTotalMinutes?: number;
         element: Element
     }) {
+        const isDocElementBlock = info.element?.classList?.contains('protyle-wysiwyg');
         const blockEl = (info.element && info.element.getAttribute("data-node-id") === blockId)
             ? (info.element as HTMLElement)
-            : (protyle.element.querySelector(`[data-node-id="${blockId}"]`) as HTMLElement);
+            : (protyle.element.querySelector(`[data-node-id="${blockId}"]`) as HTMLElement)
+            || (isDocElementBlock ? (info.element as HTMLElement) : null);
 
         if (!blockEl) return;
 
         const container = this._findButtonContainer(blockEl, info.element);
         if (!container) return;
+
 
         const existingProjectButtons = new Map<string, HTMLElement>();
         container.querySelectorAll(`.block-project-btn[data-block-id="${blockId}"]`).forEach((btn: HTMLElement) => {
@@ -1088,33 +1230,41 @@ export class TaskNoteDOMManager {
         const pomodoroTotalMinutes = selfPomodoroStats.minutes + linkedPomodoroStats.minutes;
         const hasPomodoroSummary = pomodoroTotalCount > 0 || pomodoroTotalMinutes > 0;
         const existingPomodoroBtn = container.querySelector(`.block-pomodoro-summary[data-block-id="${blockId}"]`) as HTMLElement | null;
-        if (hasPomodoroSummary) {
-            if (!existingPomodoroBtn) {
-                const pomodoroBtn = this._createPomodoroSummaryButton(blockId, pomodoroTotalCount, pomodoroTotalMinutes, linkedReminderIds);
-                container.appendChild(pomodoroBtn);
-            } else {
-                const prevCount = this.parsePomodoroMetric(existingPomodoroBtn.dataset.pomodoroTotalCount);
-                const prevMinutes = this.parsePomodoroMetric(existingPomodoroBtn.dataset.pomodoroTotalMinutes);
-                const prevReminderIdsKey = this.getReminderIdsKey(existingPomodoroBtn.dataset.pomodoroIncludeEventIds);
-                const nextReminderIdsKey = this.getReminderIdsKey(linkedReminderIds);
-                if (prevCount !== pomodoroTotalCount || prevMinutes !== pomodoroTotalMinutes || prevReminderIdsKey !== nextReminderIdsKey) {
-                    this._updatePomodoroSummaryButton(existingPomodoroBtn, pomodoroTotalCount, pomodoroTotalMinutes, linkedReminderIds);
+        const isDocumentBlock = info.element?.classList?.contains('protyle-wysiwyg');
+
+        // 普通块在同步阶段更新番茄按钮；文档块完全由异步 refreshPomodoroSummaryWithMergedSessions 统一算全量并更新，避免数据竞争引发交替闪烁
+        if (!isDocumentBlock) {
+            if (hasPomodoroSummary) {
+                if (!existingPomodoroBtn) {
+                    const pomodoroBtn = this._createPomodoroSummaryButton(blockId, pomodoroTotalCount, pomodoroTotalMinutes, linkedReminderIds);
+                    container.appendChild(pomodoroBtn);
+                } else {
+                    const prevCount = this.parsePomodoroMetric(existingPomodoroBtn.dataset.pomodoroTotalCount);
+                    const prevMinutes = this.parsePomodoroMetric(existingPomodoroBtn.dataset.pomodoroTotalMinutes);
+                    const prevReminderIdsKey = this.getReminderIdsKey(existingPomodoroBtn.dataset.pomodoroIncludeEventIds);
+                    const nextReminderIdsKey = this.getReminderIdsKey(linkedReminderIds);
+                    if (prevCount !== pomodoroTotalCount || prevMinutes !== pomodoroTotalMinutes || prevReminderIdsKey !== nextReminderIdsKey) {
+                        this._updatePomodoroSummaryButton(existingPomodoroBtn, pomodoroTotalCount, pomodoroTotalMinutes, linkedReminderIds);
+                    }
+                    if (existingPomodoroBtn.parentElement !== container) {
+                        container.appendChild(existingPomodoroBtn);
+                    }
                 }
-                if (existingPomodoroBtn.parentElement !== container) {
-                    container.appendChild(existingPomodoroBtn);
-                }
+            } else if (existingPomodoroBtn) {
+                existingPomodoroBtn.remove();
             }
-        } else if (existingPomodoroBtn) {
-            existingPomodoroBtn.remove();
         }
 
-        void this.refreshPomodoroSummaryWithMergedSessions(
-            protyle,
-            blockId,
-            selfPomodoroCount,
-            selfPomodoroMinutes,
-            linkedReminderIds
-        );
+        // 异步刷新（含子任务/文档内子块全量聚合）
+        if (hasPomodoroSummary || isDocumentBlock) {
+            void this.refreshPomodoroSummaryWithMergedSessions(
+                protyle,
+                blockId,
+                selfPomodoroCount,
+                selfPomodoroMinutes,
+                linkedReminderIds
+            );
+        }
     }
 
     private async refreshPomodoroSummaryWithMergedSessions(
@@ -1124,6 +1274,7 @@ export class TaskNoteDOMManager {
         selfPomodoroMinutes: number,
         linkedReminderIds: string[]
     ) {
+        if (!this.isProtyleVisible(protyle)) return;
         const nextTaskId = (this.latestPomodoroSummaryTaskByBlock.get(blockId) || 0) + 1;
         this.latestPomodoroSummaryTaskByBlock.set(blockId, nextTaskId);
         try {
@@ -1135,16 +1286,63 @@ export class TaskNoteDOMManager {
             return;
         }
 
-        const linkedStats = this.getBoundPomodoroStatsFromCache(linkedReminderIds);
+        // 提前加载 reminderData，供子任务展开和文档级聚合复用
+        let reminderData: Record<string, any> | null = null;
+        try {
+            if (this.plugin && typeof this.plugin.loadReminderData === 'function') {
+                reminderData = await this.plugin.loadReminderData() as Record<string, any>;
+            }
+        } catch (e) {
+            console.warn("Failed to load reminderData:", e);
+        }
+
+        // 辅助：只有后缀是 YYYY-MM-DD 时才去掉（重复任务实例），其他情况保留完整 ID
+        const getSeriesBaseId = (id: string): string => {
+            const m = id.match(/^(.+)_(\d{4}-\d{2}-\d{2})$/);
+            return m ? m[1] : id;
+        };
+
+        // 预建 parentId -> [childId] 索引（供子任务展开和文档级聚合复用）
+        let childrenByParentId: Map<string, string[]> | null = null;
+        if (reminderData) {
+            childrenByParentId = new Map();
+            for (const rem of Object.values(reminderData) as any[]) {
+                if (!rem?.parentId || !rem.id) continue;
+                const parentBase = getSeriesBaseId(String(rem.parentId));
+                if (!childrenByParentId.has(parentBase)) childrenByParentId.set(parentBase, []);
+                childrenByParentId.get(parentBase)!.push(rem.id);
+            }
+        }
+
+        // 扩展 linkedReminderIds 以包含子任务的 ID（通过 parentId 字段，最多2层递归）
+        let expandedLinkedIds = this.normalizeReminderIds(linkedReminderIds);
+        if (expandedLinkedIds.length > 0 && childrenByParentId) {
+            const visited = new Set<string>(expandedLinkedIds);
+            const collectSubtaskIds = (ids: string[], depth: number) => {
+                if (depth > 2) return;
+                for (const id of ids) {
+                    const baseId = getSeriesBaseId(id);
+                    const childIds = childrenByParentId!.get(baseId);
+                    if (!childIds?.length) continue;
+                    for (const subId of childIds) {
+                        if (!subId || visited.has(subId)) continue;
+                        visited.add(subId);
+                        expandedLinkedIds.push(subId);
+                        collectSubtaskIds([subId], depth + 1);
+                    }
+                }
+            };
+            collectSubtaskIds([...expandedLinkedIds], 0);
+        }
+        const linkedStats = this.getBoundPomodoroStatsFromCache(expandedLinkedIds);
         const selfStats = this.getSelfPomodoroStats(
             blockId,
             selfPomodoroCount,
             selfPomodoroMinutes,
             linkedStats
         );
-        const mergedCount = Math.max(0, Math.floor(selfStats.count + linkedStats.count));
-        const mergedMinutes = Math.max(0, Math.floor(selfStats.minutes + linkedStats.minutes));
-        const hasPomodoroSummary = mergedCount > 0 || mergedMinutes > 0;
+        let mergedCount = Math.max(0, Math.floor(selfStats.count + linkedStats.count));
+        let mergedMinutes = Math.max(0, Math.floor(selfStats.minutes + linkedStats.minutes));
 
         const trackedSource =
             this._findTrackedSourceForBlock(protyle, blockId) ||
@@ -1152,6 +1350,130 @@ export class TaskNoteDOMManager {
         const blockEl = (protyle?.element?.querySelector?.(`[data-node-id="${blockId}"]`) as HTMLElement | null) ||
             (trackedSource as HTMLElement | null);
         if (!trackedSource || !blockEl) return;
+
+        let summaryIncludeEventIds = expandedLinkedIds;
+
+        // 文档块：基于已有番茄数据的 eventId 反向判定是否属于当前文档，极速、准确且脱离 DOM 渲染限制
+        const isDocumentBlock = trackedSource.classList.contains("protyle-wysiwyg");
+        if (isDocumentBlock) {
+            const cachedSummary = this.docPomodoroSummaryCache.get(blockId);
+            if (cachedSummary && cachedSummary.cacheVersion === this.pomodoroStatsCacheUpdatedAt) {
+                mergedCount = cachedSummary.count;
+                mergedMinutes = cachedSummary.minutes;
+                summaryIncludeEventIds = cachedSummary.includeEventIds;
+            } else {
+                try {
+                    // 1. 获取所有已有番茄数据的 eventId / baseEventId
+                    const candidateEventIds = new Set<string>([
+                        ...this.pomodoroStatsByEventId.keys(),
+                        ...this.pomodoroStatsByBaseEventId.keys(),
+                    ]);
+
+                    const matchedDocEventIds = new Set<string>();
+                    const unknownBlockIdsToQuery = new Map<string, string[]>(); // blockId -> eventIds
+
+                    // 辅助：递归判断提醒任务及其父任务链是否归属于当前文档
+                    const isTaskInDoc = (rem: any): boolean => {
+                        if (!rem) return false;
+                        if (rem.docId === blockId || rem.blockId === blockId) return true;
+                        let current = rem;
+                        const visited = new Set<string>([rem.id]);
+                        while (current && current.parentId && reminderData) {
+                            const parentBase = getSeriesBaseId(current.parentId);
+                            if (visited.has(parentBase)) break;
+                            visited.add(parentBase);
+                            const parentRem = reminderData[parentBase] || reminderData[current.parentId];
+                            if (!parentRem) break;
+                            if (parentRem.docId === blockId || parentRem.blockId === blockId) return true;
+                            current = parentRem;
+                        }
+                        return false;
+                    };
+
+                    for (const eventId of candidateEventIds) {
+                        if (!eventId) continue;
+                        if (eventId === blockId) {
+                            matchedDocEventIds.add(eventId);
+                            continue;
+                        }
+
+                        const baseId = getSeriesBaseId(eventId);
+                        const rem = reminderData ? (reminderData[baseId] || reminderData[eventId]) : null;
+
+                        if (rem) {
+                            if (isTaskInDoc(rem)) {
+                                matchedDocEventIds.add(eventId);
+                            } else if (rem.blockId) {
+                                const cachedRootId = this.blockRootIdCache.get(rem.blockId);
+                                if (cachedRootId !== undefined) {
+                                    if (cachedRootId === blockId) {
+                                        matchedDocEventIds.add(eventId);
+                                    }
+                                } else {
+                                    if (!unknownBlockIdsToQuery.has(rem.blockId)) {
+                                        unknownBlockIdsToQuery.set(rem.blockId, []);
+                                    }
+                                    unknownBlockIdsToQuery.get(rem.blockId)!.push(eventId);
+                                }
+                            }
+                        } else {
+                            const cachedRootId = this.blockRootIdCache.get(eventId);
+                            if (cachedRootId !== undefined) {
+                                if (cachedRootId === blockId) {
+                                    matchedDocEventIds.add(eventId);
+                                }
+                            } else {
+                                if (!unknownBlockIdsToQuery.has(eventId)) {
+                                    unknownBlockIdsToQuery.set(eventId, []);
+                                }
+                                unknownBlockIdsToQuery.get(eventId)!.push(eventId);
+                            }
+                        }
+                    }
+
+                    // 2. 如果存在待校验归属的块 ID，只针对这少量块 ID 发起 SQL 查询校验 root_id
+                    if (unknownBlockIdsToQuery.size > 0) {
+                        try {
+                            const { sql } = await import("../../api");
+                            const idsStr = Array.from(unknownBlockIdsToQuery.keys()).map(id => `'${id}'`).join(",");
+                            const rows = await sql(`SELECT id, root_id FROM blocks WHERE id IN (${idsStr}) LIMIT -1`);
+                            if (Array.isArray(rows)) {
+                                for (const row of rows) {
+                                    if (row && row.id && row.root_id) {
+                                        this.blockRootIdCache.set(row.id, row.root_id);
+                                        if (row.root_id === blockId) {
+                                            const evIds = unknownBlockIdsToQuery.get(row.id);
+                                            if (evIds) {
+                                                evIds.forEach(id => matchedDocEventIds.add(id));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } catch (sqlErr) {
+                            console.warn("SQL query failed to verify block ID document:", sqlErr);
+                        }
+                    }
+
+                    // 3. 一次性累加所有归属于当前文档的番茄钟数据
+                    const docStats = this.getBoundPomodoroStatsFromCache(Array.from(matchedDocEventIds));
+                    mergedCount = Math.max(0, Math.floor(docStats.count));
+                    mergedMinutes = Math.max(0, Math.floor(docStats.minutes));
+                    summaryIncludeEventIds = Array.from(matchedDocEventIds);
+
+                    this.docPomodoroSummaryCache.set(blockId, {
+                        count: mergedCount,
+                        minutes: mergedMinutes,
+                        includeEventIds: summaryIncludeEventIds,
+                        cacheVersion: this.pomodoroStatsCacheUpdatedAt,
+                    });
+                } catch (err) {
+                    console.warn("Failed to reverse-match pomodoro data at document level:", err);
+                }
+            }
+        }
+
+        const hasPomodoroSummary = mergedCount > 0 || mergedMinutes > 0;
 
         const container = this._findButtonContainer(blockEl, trackedSource);
         if (!container) return;
@@ -1165,10 +1487,13 @@ export class TaskNoteDOMManager {
         }
 
         if (!existingPomodoroBtn) {
-            container.appendChild(this._createPomodoroSummaryButton(blockId, mergedCount, mergedMinutes, linkedReminderIds));
+            container.appendChild(this._createPomodoroSummaryButton(blockId, mergedCount, mergedMinutes, summaryIncludeEventIds));
             return;
         }
-        this._updatePomodoroSummaryButton(existingPomodoroBtn, mergedCount, mergedMinutes, linkedReminderIds);
+        this._updatePomodoroSummaryButton(existingPomodoroBtn, mergedCount, mergedMinutes, summaryIncludeEventIds);
+        if (existingPomodoroBtn.parentElement !== container) {
+            container.appendChild(existingPomodoroBtn);
+        }
         if (existingPomodoroBtn.parentElement !== container) {
             container.appendChild(existingPomodoroBtn);
         }
@@ -1231,7 +1556,7 @@ export class TaskNoteDOMManager {
             const projectManager = ProjectManager.getInstance(this.plugin);
             return projectManager.getMilestoneDateDisplayInfoSync(projectId, milestoneIds);
         } catch (error) {
-            console.warn("同步获取里程碑日期展示信息失败:", error);
+            console.warn("Failed to synchronously get milestone date display information:", error);
             return null;
         }
     }
@@ -1241,7 +1566,7 @@ export class TaskNoteDOMManager {
             const projectManager = ProjectManager.getInstance(this.plugin);
             return await projectManager.getMilestoneDateDisplayInfo(projectId, milestoneIds);
         } catch (error) {
-            console.warn("获取里程碑日期展示信息失败:", error);
+            console.warn("Failed to get milestone date display information:", error);
             return null;
         }
     }
@@ -1307,7 +1632,7 @@ export class TaskNoteDOMManager {
         try {
             displayInfo = await this.getBoundReminderDateDisplayInfoFromPlugin(normalizedReminderIds);
         } catch (error) {
-            console.warn("获取绑定任务日期展示信息失败:", error);
+            console.warn("Failed to get bound task date display information:", error);
             return;
         }
 
@@ -1413,7 +1738,7 @@ export class TaskNoteDOMManager {
                     showMessage(i18n("taskNotFound") || "任务不存在", 3000, "error");
                     return;
                 }
-                const { QuickReminderDialog } = await import("../QuickReminderDialog");
+                const { QuickReminderDialog } = await import("../dialog/QuickReminderDialog");
                 const dialog = new QuickReminderDialog(undefined, undefined, undefined, undefined, {
                     blockId,
                     reminder,
@@ -1422,7 +1747,7 @@ export class TaskNoteDOMManager {
                 });
                 dialog.show();
             } catch (error) {
-                console.error("打开绑定任务日期编辑对话框失败:", error);
+                console.error("Failed to open bound task date edit dialog:", error);
                 showMessage(i18n("openModifyDialogFailed") || "打开修改对话框失败，请重试", 3000, "error");
             }
         });
@@ -1444,11 +1769,11 @@ export class TaskNoteDOMManager {
         const safeReminderId = String(reminderId || "").trim();
         const safeDisplayText = String(displayText || "").trim();
         const safeDisplayType = displayType === "completed" ? "completed" : "schedule";
-        const prefix = safeDisplayType === "completed" ? "✅" : (safeDisplayText.startsWith('⏰') ? '' : '🗓');
+        const prefix = safeDisplayType === "completed" ? "✅" : (safeDisplayText.startsWith('⏰') ? '' : '🗓️');
         const text = safeDisplayText ? (prefix ? `${prefix} ${safeDisplayText}` : safeDisplayText) : prefix;
         const ariaText = safeDisplayType === "completed"
-            ? `最近完成时间 ${safeDisplayText}，点击编辑任务日期`
-            : `任务安排时间 ${safeDisplayText}，点击编辑任务日期`;
+            ? i18n("taskCompletionDateTooltip", { date: String(safeDisplayText) })
+            : i18n("taskScheduleDateTooltip", { date: String(safeDisplayText) });
 
         if (btn.dataset.reminderId !== safeReminderId) {
             btn.dataset.reminderId = safeReminderId;
@@ -1505,7 +1830,7 @@ export class TaskNoteDOMManager {
             e.preventDefault();
             e.stopPropagation();
             try {
-                const { PomodoroSessionsDialog } = await import("../PomodoroSessionsDialog");
+                const { PomodoroSessionsDialog } = await import("../dialog/PomodoroSessionsDialog");
                 const linkedEventIds = this.normalizeReminderIds(btn.dataset.pomodoroIncludeEventIds);
                 const includeInstances = btn.dataset.pomodoroIncludeInstances === "true";
                 const dialog = new PomodoroSessionsDialog(
@@ -1521,7 +1846,7 @@ export class TaskNoteDOMManager {
                 );
                 await dialog.show();
             } catch (error) {
-                console.error("打开番茄记录对话框失败:", error);
+                console.error("Failed to open pomodoro record dialog:", error);
                 showMessage(i18n("operationFailed") || "操作失败", 3000);
             }
         });
@@ -1535,7 +1860,7 @@ export class TaskNoteDOMManager {
 
     public _updatePomodoroSummaryButton(btn: HTMLElement, totalCount: number, totalMinutes: number, includeEventIds: string[] = []) {
         const text = this.getPomodoroSummaryText(totalCount, totalMinutes);
-        const ariaText = `番茄总数 ${totalCount}，番茄总时长 ${this.formatPomodoroDuration(totalMinutes)}`;
+        const ariaText = i18n("pomodoroTotalsTooltip", { count: String(totalCount), duration: String(this.formatPomodoroDuration(totalMinutes)) });
         const countStr = String(totalCount);
         const minutesStr = String(totalMinutes);
         const normalizedEventIds = this.normalizeReminderIds(includeEventIds);
@@ -1571,7 +1896,7 @@ export class TaskNoteDOMManager {
     public _createProjectButton(projectId: string, blockId: string): HTMLElement {
         const btn = document.createElement("button");
         btn.className = "block-project-btn block__icon fn__flex-center ariaLabel";
-        btn.setAttribute("aria-label", `打开项目看板: ${this.plugin.projectDataCache[projectId]?.title}`);
+        btn.setAttribute("aria-label", i18n("openProjectKanbanTooltip", { title: String(this.plugin.projectDataCache[projectId]?.title) }));
         btn.style.cssText = `
             margin-left: 6px;
             padding: 2px;
@@ -1603,7 +1928,7 @@ export class TaskNoteDOMManager {
                 const title = project ? project.title : projectId;
                 this.plugin.openProjectKanbanTab(projectId, title);
             } catch (error) {
-                console.error("打开项目看板失败:", error);
+                console.error("Failed to open project kanban:", error);
                 this.plugin.openProjectKanbanTab(projectId, projectId);
             }
         });
@@ -1614,7 +1939,7 @@ export class TaskNoteDOMManager {
     public _createBindButton(blockId: string): HTMLElement {
         const btn = document.createElement("button");
         btn.className = "block-bind-reminders-btn block__icon fn__flex-center ariaLabel";
-        btn.setAttribute("aria-label", "查看绑定任务");
+        btn.setAttribute("aria-label", i18n("viewBoundTasks"));
         btn.style.cssText = `
             margin-left: 6px;
             padding: 2px;
@@ -1634,17 +1959,17 @@ export class TaskNoteDOMManager {
         btn.innerHTML = `<svg class="b3-list-item__graphic" style="width:14px;height:14px"><use xlink:href="#iconTNTodoList"></use></svg>`;
         btn.dataset.blockId = blockId;
         btn.setAttribute("data-plugin-added", "reminder-plugin");
-        btn.classList.add('ariaLabel'); btn.setAttribute('aria-label', "查看绑定任务");
+        btn.classList.add('ariaLabel'); btn.setAttribute('aria-label', i18n("viewBoundTasks"));
 
         btn.addEventListener("click", async (e) => {
             e.preventDefault();
             e.stopPropagation();
             try {
-                const { BlockRemindersDialog } = await import("../BlockRemindersDialog");
+                const { BlockRemindersDialog } = await import("../dialog/BlockRemindersDialog");
                 const dialog = new BlockRemindersDialog(blockId, this.plugin);
                 await dialog.show();
             } catch (err) {
-                console.error("打开块绑定任务对话框失败:", err);
+                console.error("Failed to open block bound task dialog:", err);
             }
         });
 
@@ -1694,7 +2019,7 @@ export class TaskNoteDOMManager {
             return;
         }
 
-        const { ProjectKanbanView } = await import("../ProjectKanbanView");
+        const { ProjectKanbanView } = await import("../panel/ProjectKanbanView");
         const tempContainer = document.createElement("div");
         const tempView = new ProjectKanbanView(tempContainer, this.plugin, projectId);
         await tempView.showMilestoneTasksDialog(milestone, groupId);
@@ -1715,7 +2040,7 @@ export class TaskNoteDOMManager {
                 if (!targetProjectId || targetMilestoneIds.length === 0) return;
                 await this.openMilestoneTasksDialog(targetProjectId, targetMilestoneIds);
             } catch (err) {
-                console.error("打开里程碑任务对话框失败:", err);
+                console.error("Failed to open milestone task dialog:", err);
             }
         });
 
@@ -1739,8 +2064,8 @@ export class TaskNoteDOMManager {
         const safeDisplayText = String(displayText || "").trim();
         const text = safeDisplayText ? `🚩 ${safeDisplayText}` : "🚩";
         const ariaText = safeDisplayText
-            ? `查看里程碑任务，日期 ${safeDisplayText}`
-            : "查看里程碑任务";
+            ? i18n("milestoneDateTooltip", { date: String(safeDisplayText) })
+            : i18n("viewMilestoneTasks");
 
         if (btn.dataset.projectId !== safeProjectId) {
             btn.dataset.projectId = safeProjectId;

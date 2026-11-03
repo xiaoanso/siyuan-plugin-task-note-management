@@ -1,0 +1,587 @@
+import { setBlockAttrs } from "../../api";
+import { normalizeReminderSkipWeekendMode } from "../../utils/reminderSkipDate";
+import { RepeatInstanceState } from "../dialog/RepeatSettingsDialog";
+
+interface AudioFileItemLike {
+    path: string;
+    removed?: boolean;
+    replaces?: string;
+}
+
+interface MigrationPlugin {
+    name: string;
+    loadSettings(update?: boolean): Promise<any>;
+    saveSettings(settings: any): Promise<void>;
+    loadData(file: string): Promise<any>;
+    saveData(file: string, data: any): Promise<any>;
+    removeData(file: string): Promise<any>;
+    loadReminderData(update?: boolean): Promise<any>;
+    saveReminderData(data: any): Promise<void>;
+}
+
+import { readDir } from "../../api";
+
+const HABIT_DATA_FILE = "habit.json";
+const HABIT_CHECKIN_DIR = "habitCheckin";
+const LEGACY_FILTER_SETTINGS_FILE = "settings.json";
+const FILTER_SETTINGS_FILE = "filter-settings.json";
+
+/**
+ * 执行数据迁移
+ */
+export async function performDataMigration(plugin: MigrationPlugin): Promise<void> {
+    try {
+        const settings = await plugin.loadSettings();
+
+        if (!settings.datatransfer?.filterSettingsFileTransfer) {
+            await migrateFilterSettingsFile(plugin, settings);
+        }
+
+        // 检查是否需要迁移绑定块属性
+        if (!settings.datatransfer?.bindblockAddAttr) {
+            console.log("Starting bound block attribute migration...");
+            await migrateBindBlockAttributes(plugin);
+            console.log("Bound block attribute migration complete");
+
+            // 标记迁移完成
+            settings.datatransfer = settings.datatransfer || {};
+            settings.datatransfer.bindblockAddAttr = true;
+            await plugin.saveSettings(settings);
+        }
+
+        // 检查是否需要迁移 termType -> kanbanStatus 并删除 termType 键
+        if (!settings.datatransfer?.termTypeTransfer) {
+            try {
+                console.log("Starting termType to kanbanStatus migration and termType key removal...");
+                const reminderData = await plugin.loadReminderData(true);
+                if (reminderData && typeof reminderData === "object") {
+                    let mappedCount = 0;
+                    let removedCount = 0;
+                    for (const [id, item] of Object.entries(reminderData) as [string, any][]) {
+                        try {
+                            if (!item || typeof item !== "object") continue;
+
+                            // 如果当前状态是 todo 且 termType 为 short_term/long_term，则将 kanbanStatus 设置为 termType
+                            if (item.kanbanStatus === "todo" && (item.termType === "short_term" || item.termType === "long_term")) {
+                                item.kanbanStatus = item.termType;
+                                mappedCount++;
+                            }
+
+                            // 无论是否做了映射，都删除 termType 键（按要求移除该键）
+                            if ("termType" in item) {
+                                try {
+                                    delete item.termType;
+                                    removedCount++;
+                                } catch (e) {
+                                    // 某些情况下 item 可能是不可写对象，尝试设置为 undefined 再删除
+                                    try {
+                                        (item as any).termType = undefined;
+                                        delete (item as any).termType;
+                                        removedCount++;
+                                    } catch (ee) {
+                                        console.warn(`Failed to remove termType key from reminder ${id}:`, ee);
+                                    }
+                                }
+                            }
+                        } catch (err) {
+                            console.warn(`Error migrating reminder ${id}:`, err);
+                        }
+                    }
+
+                    if (mappedCount > 0 || removedCount > 0) {
+                        await plugin.saveReminderData(reminderData);
+                        console.log(`termType migration complete: mapped ${mappedCount} entries and removed ${removedCount} termType keys`);
+                    } else {
+                        console.log("termType migration complete: no entries to map or remove");
+                    }
+                } else {
+                    console.log("No reminder data found; skipping termType migration");
+                }
+
+                settings.datatransfer = settings.datatransfer || {};
+                settings.datatransfer.termTypeTransfer = true;
+                await plugin.saveSettings(settings);
+            } catch (err) {
+                console.error("Failed to migrate termType to kanbanStatus:", err);
+            }
+        }
+
+        // 检查是否需要迁移随机休息相关的设置项名称 (randomNotification -> randomRest)
+        if (!settings.datatransfer?.randomRestTransfer) {
+            console.log("Starting random break settings migration...");
+            let migratedCount = 0;
+            const mapping = {
+                randomNotificationEnabled: "randomRestEnabled",
+                randomNotificationMinInterval: "randomRestMinInterval",
+                randomNotificationMaxInterval: "randomRestMaxInterval",
+                randomNotificationBreakDuration: "randomRestBreakDuration",
+                randomNotificationSystemNotification: "randomRestSystemNotification",
+                randomNotificationPopupWindow: "randomRestPopupWindow",
+                randomNotificationSounds: "randomRestSounds",
+                randomNotificationEndSound: "randomRestEndSound",
+            };
+
+            for (const [oldKey, newKey] of Object.entries(mapping)) {
+                if (oldKey in settings) {
+                    (settings as any)[newKey] = (settings as any)[oldKey];
+                    delete (settings as any)[oldKey];
+                    migratedCount++;
+                }
+            }
+
+            // 迁移 audioFileLists 和 audioSelected 中的键名
+            const audioMapping = {
+                randomNotificationSounds: "randomRestSounds",
+                randomNotificationEndSound: "randomRestEndSound",
+            };
+
+            if (settings.audioFileLists) {
+                for (const [oldKey, newKey] of Object.entries(audioMapping)) {
+                    if (settings.audioFileLists[oldKey]) {
+                        settings.audioFileLists[newKey] = settings.audioFileLists[oldKey];
+                        delete settings.audioFileLists[oldKey];
+                        migratedCount++;
+                    }
+                }
+            }
+
+            if (settings.audioSelected) {
+                for (const [oldKey, newKey] of Object.entries(audioMapping)) {
+                    if (settings.audioSelected[oldKey]) {
+                        settings.audioSelected[newKey] = settings.audioSelected[oldKey];
+                        delete settings.audioSelected[oldKey];
+                        migratedCount++;
+                    }
+                }
+            }
+
+            if (migratedCount > 0) {
+                settings.datatransfer = settings.datatransfer || {};
+                settings.datatransfer.randomRestTransfer = true;
+                await plugin.saveSettings(settings);
+                console.log(`Random break settings migration complete: ${migratedCount} entries migrated`);
+            }
+        }
+
+        // 检查是否需要迁移 removeDateAfterDetection 从 bool 到 string
+        if (typeof settings.removeDateAfterDetection === "boolean") {
+            console.log("Starting removeDateAfterDetection migration...");
+            const oldVal = (settings as any).removeDateAfterDetection;
+            settings.removeDateAfterDetection = oldVal ? "all" : "none";
+            await plugin.saveSettings(settings);
+            console.log("removeDateAfterDetection migration complete");
+        }
+
+        if (!settings.datatransfer?.reminderSkipWeekendModeTransfer) {
+            await migrateReminderSkipWeekendMode(plugin, settings);
+        }
+
+        // 检查是否需要迁移音频文件列表
+        if (!settings.datatransfer?.audioFileTransfer) {
+            console.log("Starting audio file list migration...");
+            const audioKeys = [
+                "notificationSound",
+                "pomodoroWorkSound",
+                "pomodoroBreakSound",
+                "pomodoroLongBreakSound",
+                "pomodoroWorkEndSound",
+                "pomodoroBreakEndSound",
+                "randomRestSounds",
+                "randomRestEndSound",
+            ];
+            if (!settings.audioFileLists) settings.audioFileLists = {};
+            if (!settings.audioSelected) settings.audioSelected = {};
+
+            let audioMigratedCount = 0;
+            for (const key of audioKeys) {
+                const existing = (settings as any)[key] as string | undefined;
+                if (existing) {
+                    const list: any[] = settings.audioFileLists[key] ?? [];
+                    // 确保 list 是 AudioFileItem[]
+                    const itemList: AudioFileItemLike[] = list.map((item) =>
+                        typeof item === "string" ? { path: item } : item
+                    );
+
+                    if (!itemList.some((i) => i.path === existing)) {
+                        itemList.push({ path: existing }); // 保持原有顺序，加到后面
+                        audioMigratedCount++;
+                    }
+                    settings.audioFileLists[key] = itemList;
+                    // 记录当前选中
+                    settings.audioSelected[key] = existing;
+                    // 迁移后从根部删除旧键
+                    delete (settings as any)[key];
+                } else if (settings.audioFileLists[key]) {
+                    // 如果没有旧键，但存在旧的 string[] 列表，也需要转换
+                    const list = settings.audioFileLists[key];
+                    if (list.length > 0 && typeof list[0] === "string") {
+                        settings.audioFileLists[key] = (list as any).map((p: string) => ({ path: p }));
+                    }
+                }
+            }
+
+            settings.datatransfer = settings.datatransfer || {};
+            settings.datatransfer.audioFileTransfer = true;
+            await plugin.saveSettings(settings);
+            console.log(`Audio file list migration complete: ${audioMigratedCount} entries updated`);
+        }
+        if (!settings.datatransfer?.habitCheckinTransfer) {
+            await migrateHabitCheckinData(plugin, settings);
+        }
+        if (!settings.datatransfer?.pomodoroRecordTransfer) {
+            await migratePomodoroRecords(plugin, settings);
+        }
+
+        if (!settings.datatransfer?.repeatInstanceStateTransfer) {
+            await migrateRepeatInstanceState(plugin, settings);
+        }
+    } catch (error) {
+        console.error("Data migration failed:", error);
+    }
+}
+
+async function migrateFilterSettingsFile(plugin: MigrationPlugin, settings: any): Promise<void> {
+    try {
+        console.log("Starting filter configuration migration: settings.json -> filter-settings.json...");
+
+        const legacySettings = await plugin.loadData(LEGACY_FILTER_SETTINGS_FILE);
+        if (legacySettings && typeof legacySettings === "object" && !Array.isArray(legacySettings)) {
+            const currentSettings = await plugin.loadData(FILTER_SETTINGS_FILE);
+            const nextSettings =
+                currentSettings && typeof currentSettings === "object" && !Array.isArray(currentSettings)
+                    ? { ...legacySettings, ...currentSettings }
+                    : legacySettings;
+
+            await plugin.saveData(FILTER_SETTINGS_FILE, nextSettings);
+
+            try {
+                await plugin.removeData(LEGACY_FILTER_SETTINGS_FILE);
+            } catch (error) {
+                console.warn(`Failed to remove legacy filter configuration file ${LEGACY_FILTER_SETTINGS_FILE}:`, error);
+            }
+
+            console.log("Filter configuration migration complete");
+        } else {
+            console.log("No legacy filter configuration file found; skipping migration");
+        }
+
+        settings.datatransfer = settings.datatransfer || {};
+        settings.datatransfer.filterSettingsFileTransfer = true;
+        await plugin.saveSettings(settings);
+    } catch (error) {
+        console.error("Filter configuration migration failed:", error);
+    }
+}
+
+function migrateReminderSkipWeekendFields(target: any): boolean {
+    if (!target || typeof target !== "object") return false;
+
+    let changed = false;
+    const currentMode = normalizeReminderSkipWeekendMode(target.reminderSkipWeekendMode);
+    const legacyMode = normalizeReminderSkipWeekendMode(target.reminderSkipWeekends);
+
+    if (currentMode !== undefined) {
+        if (target.reminderSkipWeekendMode !== currentMode) {
+            target.reminderSkipWeekendMode = currentMode;
+            changed = true;
+        }
+    } else if (legacyMode !== undefined) {
+        target.reminderSkipWeekendMode = legacyMode;
+        changed = true;
+    }
+
+    if (Object.prototype.hasOwnProperty.call(target, "reminderSkipWeekends")) {
+        delete target.reminderSkipWeekends;
+        changed = true;
+    }
+
+    return changed;
+}
+
+async function migrateReminderSkipWeekendMode(plugin: MigrationPlugin, settings: any): Promise<void> {
+    try {
+        console.log("Starting reminderSkipWeekends to reminderSkipWeekendMode migration...");
+
+        let changedCount = 0;
+        if (migrateReminderSkipWeekendFields(settings)) {
+            changedCount++;
+        }
+
+        const reminderData = await plugin.loadReminderData(true);
+        if (reminderData && typeof reminderData === "object") {
+            for (const reminder of Object.values(reminderData) as any[]) {
+                if (!reminder || typeof reminder !== "object") continue;
+
+                if (migrateReminderSkipWeekendFields(reminder)) {
+                    changedCount++;
+                }
+
+                if (reminder.repeat && typeof reminder.repeat === "object") {
+                    if (migrateReminderSkipWeekendFields(reminder.repeat)) {
+                        changedCount++;
+                    }
+
+                    const modifications = reminder.repeat.instanceModifications;
+                    if (modifications && typeof modifications === "object") {
+                        for (const modification of Object.values(modifications) as any[]) {
+                            if (migrateReminderSkipWeekendFields(modification)) {
+                                changedCount++;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (changedCount > 0) {
+                await plugin.saveReminderData(reminderData);
+            }
+        }
+
+        settings.datatransfer = settings.datatransfer || {};
+        settings.datatransfer.reminderSkipWeekendModeTransfer = true;
+        await plugin.saveSettings(settings);
+        console.log(`reminderSkipWeekends migration complete: ${changedCount} entries updated`);
+    } catch (error) {
+        console.error("reminderSkipWeekends migration failed:", error);
+    }
+}
+
+/**
+ * 迁移绑定块属性：为绑定了提醒的块添加 custom-bind-reminders 属性
+ */
+async function migrateBindBlockAttributes(plugin: MigrationPlugin): Promise<void> {
+    try {
+        const reminderData = await plugin.loadReminderData();
+
+        if (!reminderData || typeof reminderData !== "object") {
+            console.log("No reminder data found; skipping migration");
+            return;
+        }
+
+        let migratedCount = 0;
+
+        // 遍历所有提醒，找到绑定到块的提醒
+        for (const [reminderId, reminder] of Object.entries(reminderData) as [string, any][]) {
+            if (!reminder || !reminder.blockId) continue;
+
+            try {
+                // 检查块是否已经有 custom-bind-reminders 属性
+                const blockElement = document.querySelector(`[data-node-id="${reminder.blockId}"]`);
+                if (!blockElement) continue;
+
+                const existingAttr = blockElement.getAttribute("custom-bind-reminders");
+                if (existingAttr) {
+                    // 如果已经存在，检查是否包含当前提醒ID
+                    const existingIds = existingAttr.split(",").map((s) => s.trim());
+                    if (existingIds.includes(reminderId)) {
+                        continue; // 已经包含，跳过
+                    }
+                    // 添加新的提醒ID
+                    existingIds.push(reminderId);
+                    await setBlockAttrs(reminder.blockId, {
+                        "custom-bind-reminders": existingIds.join(","),
+                    });
+                } else {
+                    // 不存在，设置新的属性
+                    await setBlockAttrs(reminder.blockId, {
+                        "custom-bind-reminders": reminderId,
+                    });
+                }
+
+                migratedCount++;
+            } catch (error) {
+                console.warn(`Failed to migrate attributes of block ${reminder.blockId}:`, error);
+            }
+        }
+
+        console.log(`Migrated attributes of ${migratedCount} bound blocks`);
+    } catch (error) {
+        console.error("Error migrating bound block attributes:", error);
+        throw error;
+    }
+}
+
+function getHabitCheckinFileName(habitId: string): string {
+    return `${HABIT_CHECKIN_DIR}/${habitId}.json`;
+}
+
+async function migrateHabitCheckinData(plugin: MigrationPlugin, settings: any): Promise<void> {
+    try {
+        const rawHabitData = await plugin.loadData(HABIT_DATA_FILE);
+        const habitData = (rawHabitData && typeof rawHabitData === "object") ? rawHabitData : {};
+        const nextHabitData: Record<string, any> = {};
+        const activeHabitIds = new Set<string>();
+
+        for (const [habitId, habit] of Object.entries(habitData) as [string, any][]) {
+            if (!habit || typeof habit !== "object") {
+                nextHabitData[habitId] = habit;
+                continue;
+            }
+
+            activeHabitIds.add(habitId);
+            await plugin.saveData(getHabitCheckinFileName(habitId), {
+                checkIns: habit.checkIns || {},
+                hasNotify: habit.hasNotify || {},
+                totalCheckIns: habit.totalCheckIns ?? 0,
+            });
+
+            const baseHabit = { ...habit };
+            delete baseHabit.checkIns;
+            delete baseHabit.hasNotify;
+            delete baseHabit.totalCheckIns;
+            nextHabitData[habitId] = baseHabit;
+        }
+
+        await plugin.saveData(HABIT_DATA_FILE, nextHabitData);
+
+        const dirPath = `/data/storage/petal/${plugin.name}/${HABIT_CHECKIN_DIR}`;
+        const existingCheckinDir = await readDir(dirPath).catch(() => null);
+        if (existingCheckinDir && Array.isArray(existingCheckinDir)) {
+            for (const entry of existingCheckinDir) {
+                if (entry.isDir || !entry.name.endsWith('.json')) continue;
+                const fileName = entry.name;
+                const habitId = fileName.replace(/\.json$/i, "");
+                if (!activeHabitIds.has(habitId)) {
+                    await plugin.removeData(getHabitCheckinFileName(habitId));
+                }
+            }
+        }
+
+        settings.datatransfer = settings.datatransfer || {};
+        settings.datatransfer.habitCheckinTransfer = true;
+        await plugin.saveSettings(settings);
+    } catch (error) {
+        console.error("Failed to migrate habit checkin data:", error);
+    }
+}
+
+async function migratePomodoroRecords(plugin: MigrationPlugin, settings: any): Promise<void> {
+    try {
+        const rawData = await plugin.loadData("pomodoro_record.json");
+        if (rawData && typeof rawData === "object") {
+            for (const [date, record] of Object.entries(rawData)) {
+                if (record && typeof record === "object") {
+                    const existing = await plugin.loadData(`pomodoroRecords/${date}.json`);
+                    if (!existing || Object.keys(existing).length === 0) {
+                        await plugin.saveData(`pomodoroRecords/${date}.json`, record);
+                    }
+                }
+            }
+            await plugin.removeData("pomodoro_record.json");
+        }
+        
+        settings.datatransfer = settings.datatransfer || {};
+        settings.datatransfer.pomodoroRecordTransfer = true;
+        await plugin.saveSettings(settings);
+        console.log("Pomodoro records migration completed.");
+    } catch (error) {
+        console.error("Failed to migrate pomodoro records:", error);
+    }
+}
+
+/**
+ * 迁移重复实例状态：将 completedInstances、completedTimes、instanceCompletedTimes、instanceModifications
+ * 合并为统一的 repeat.instances 结构。
+ */
+async function migrateRepeatInstanceState(plugin: MigrationPlugin, settings: any): Promise<void> {
+    try {
+        console.log("Starting repeat instance state migration to the unified instances structure...");
+
+        const reminderData = await plugin.loadReminderData(true);
+        if (!reminderData || typeof reminderData !== "object") {
+            settings.datatransfer = settings.datatransfer || {};
+            settings.datatransfer.repeatInstanceStateTransfer = true;
+            await plugin.saveSettings(settings);
+            console.log("No reminder data found; skipping repeat instance state migration");
+            return;
+        }
+
+        let changed = false;
+        for (const item of Object.values(reminderData) as any[]) {
+            if (!item?.repeat || typeof item.repeat !== "object") continue;
+
+            const existingInstances: Record<string, RepeatInstanceState> =
+                item.repeat.instances && typeof item.repeat.instances === "object"
+                    ? item.repeat.instances
+                    : {};
+            const completedInstances = new Set<string>(
+                Array.isArray(item.repeat.completedInstances) ? item.repeat.completedInstances : []
+            );
+            const completedTimes: Record<string, string> = {
+                ...(item.repeat.completedTimes || {}),
+                ...(item.repeat.instanceCompletedTimes || {})
+            };
+            const mods: Record<string, any> = item.repeat.instanceModifications || {};
+
+            const keys = new Set<string>([
+                ...completedInstances,
+                ...Object.keys(completedTimes),
+                ...Object.keys(mods),
+                ...Object.keys(existingInstances)
+            ]);
+
+            const instances: Record<string, RepeatInstanceState> = {};
+
+            for (const key of keys) {
+                const legacyState: RepeatInstanceState = {};
+                const mod = mods[key];
+
+                if (completedInstances.has(key) || typeof completedTimes[key] === "string") {
+                    legacyState.completed = true;
+                }
+                if (typeof completedTimes[key] === "string") {
+                    legacyState.completedTime = completedTimes[key];
+                }
+
+                if (mod && typeof mod === "object") {
+                    for (const [field, value] of Object.entries(mod)) {
+                        if (field === "date" && value === null) {
+                            legacyState.deleted = true;
+                            continue;
+                        }
+                        if (field === "completed") {
+                            if (typeof value === "boolean") legacyState.completed = value;
+                            continue;
+                        }
+                        if (field === "completedTime") {
+                            if (typeof value === "string") legacyState.completedTime = value;
+                            continue;
+                        }
+                        (legacyState as any)[field] = value === null ? undefined : value;
+                    }
+                }
+
+                // 部分迁移时以新结构为准，只用旧字段补齐尚未迁移的数据。
+                const state: RepeatInstanceState = {
+                    ...legacyState,
+                    ...(existingInstances[key] || {})
+                };
+                if (Object.keys(state).length > 0) {
+                    instances[key] = state;
+                }
+            }
+
+            if (Object.keys(instances).length > 0) {
+                item.repeat.instances = instances;
+            } else {
+                delete item.repeat.instances;
+            }
+            delete item.repeat.completedInstances;
+            delete item.repeat.completedTimes;
+            delete item.repeat.instanceCompletedTimes;
+            delete item.repeat.instanceModifications;
+            changed = true;
+        }
+
+        if (changed) {
+            await plugin.saveReminderData(reminderData);
+        }
+
+        settings.datatransfer = settings.datatransfer || {};
+        settings.datatransfer.repeatInstanceStateTransfer = true;
+        await plugin.saveSettings(settings);
+        console.log("Repeat instance state migration complete");
+    } catch (error) {
+        console.error("Repeat instance state migration failed:", error);
+    }
+}

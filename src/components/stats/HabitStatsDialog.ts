@@ -1,7 +1,7 @@
 ﻿import { Dialog } from "siyuan";
-import type { Habit } from "../HabitPanel";
-import { HabitDayDialog } from "../HabitDayDialog";
-import { PomodoroRecordManager } from "../../utils/pomodoroRecord";
+import { isHabitCheckInDayComplete, type Habit } from "../../utils/habitUtils";
+import { HabitDayDialog } from "../dialog/HabitDayDialog";
+import { PomodoroRecordManager } from "../dataManager/pomodoroRecord";
 import {
     buildLinkedHabitPomodoroData,
     getLinkedTaskPomodoroStatsByDate as getLinkedTaskPomodoroStatsByDateUtil,
@@ -12,6 +12,7 @@ import { ScatterChart, CustomChart } from 'echarts/charts';
 import { TooltipComponent, GridComponent, TitleComponent, LegendComponent } from 'echarts/components';
 import { CanvasRenderer } from 'echarts/renderers';
 import { i18n } from "../../pluginInstance";
+import { getLocaleTag } from "../../utils/dateUtils";
 
 // 注册 ECharts 组件
 use([
@@ -137,7 +138,7 @@ export class HabitStatsDialog {
                 }
             }
         } catch (error) {
-            console.warn("HabitStatsDialog 初始化番茄数据或设置失败", error);
+            console.warn("HabitStatsDialog: failed to initialize pomodoro data or settings", error);
             this.pomodoroReady = false;
             this.linkedTaskPomodoroStats = new Map();
         }
@@ -235,7 +236,7 @@ export class HabitStatsDialog {
 
         const logTab = document.createElement('button');
         logTab.className = `b3-button ${this.currentTab !== 'logs' ? 'b3-button--outline' : ''}`;
-        logTab.textContent = "打卡日志";
+        logTab.textContent = i18n("habitLogTitle");
         logTab.style.cssText = this.currentTab === 'logs' ? 'font-weight: bold;' : '';
         logTab.addEventListener('click', () => {
             this.currentTab = 'logs';
@@ -314,7 +315,7 @@ export class HabitStatsDialog {
                 card.style.cssText = 'padding: 12px; background: var(--b3-theme-surface); border-radius: 8px; text-align: center; display: flex; flex-direction: column; align-items: center;';
                 card.innerHTML = `
                     <div class="habit-emoji-stat-icon">${stat.emoji}</div>
-                    <div style="font-size: 14px; font-weight: bold; margin-bottom: 4px;">${stat.count}次</div>
+                    <div style="font-size: 14px; font-weight: bold; margin-bottom: 4px;">${i18n('habitCheckInCountValue', { count: String(stat.count) })}</div>
                     <div style="font-size: 12px; color: var(--b3-theme-on-surface-light); margin-bottom: 8px;">${stat.percentage.toFixed(1)}%</div>
                     <div style="width: 60px; height: 80px; background: var(--b3-theme-surface-lighter); border-radius: 4px; position: relative; margin-top: auto;">
                         <div style="width: 100%; height: ${stat.percentage}%; background: #40c463; border-radius: 4px; position: absolute; bottom: 0; transition: height 0.3s ease;"></div>
@@ -336,6 +337,21 @@ export class HabitStatsDialog {
         const yearlyContainer = document.createElement('div');
         container.appendChild(yearlyContainer);
         this.renderYearlyView(yearlyContainer);
+    }
+
+    private openDayEditor(dateStr: string) {
+        const dayDialog = new HabitDayDialog(this.habit, dateStr, async (updatedHabit) => {
+            await this.onSave?.(updatedHabit);
+            this.habit = updatedHabit;
+
+            // 打卡窗口可切换周内日期，保存后同步刷新摘要、月视图和年视图。
+            const container = this.dialog.element.querySelector('#habitStatsContainer') as HTMLElement;
+            if (!container) return;
+            const scrollTop = container.scrollTop;
+            this.renderContainer(container);
+            container.scrollTop = scrollTop;
+        }, this.plugin);
+        dayDialog.show();
     }
 
     private calculateStreak(): number {
@@ -384,41 +400,9 @@ export class HabitStatsDialog {
      * @returns true表示达标，false表示未达标或未打卡
      */
     private isCheckInComplete(dateStr: string): boolean {
-        if (this.getHabitGoalType(this.habit) === "pomodoro") {
-            const target = this.getHabitPomodoroTargetMinutes(this.habit);
-            const current = this.getHabitPomodoroFocusMinutes(this.habit, dateStr);
-            return current >= target;
-        }
-
-        const checkIn = this.habit.checkIns?.[dateStr];
-        if (!checkIn) return false;
-
-        // 获取当天所有打卡的emoji
-        const emojis: string[] = [];
-        if (checkIn.entries && checkIn.entries.length > 0) {
-            // 使用新格式的entries
-            checkIn.entries.forEach(entry => {
-                if (entry.emoji) emojis.push(entry.emoji);
-            });
-        } else if (checkIn.status && checkIn.status.length > 0) {
-            // 使用旧格式的status
-            emojis.push(...checkIn.status);
-        }
-
-        // 过滤出认为是成功打卡的emoji
-        const successEmojis = emojis.filter(emoji => {
-            const emojiConfig = this.habit.checkInEmojis?.find(e => e.emoji === emoji);
-            // 如果找不到配置或countsAsSuccess未定义，默认认为是成功打卡
-            return emojiConfig ? (emojiConfig.countsAsSuccess !== false) : true;
+        return isHabitCheckInDayComplete(this.habit, dateStr, {
+            getPomodoroFocusMinutes: (_, date) => this.getHabitPomodoroFocusMinutes(this.habit, date)
         });
-
-        let successCount = successEmojis.length;
-        // 兼容旧数据：只有在没有 status/entries 且有 count 时才使用 count
-        if (emojis.length === 0 && typeof checkIn.count === "number" && checkIn.count > 0) {
-            successCount = checkIn.count;
-        }
-        const target = this.habit.target || 1;
-        return successCount >= target;
     }
 
     private isHabitWithinDateRange(habit: Habit, dateStr: string): boolean {
@@ -435,6 +419,8 @@ export class HabitStatsDialog {
         const startDate = new Date(`${habit.startDate || dateStr}T00:00:00`);
 
         switch (frequency.type) {
+            case "none":
+                return false;
             case "daily":
                 if (frequency.interval) {
                     const daysDiff = Math.floor((checkDate.getTime() - startDate.getTime()) / 86400000);
@@ -492,18 +478,6 @@ export class HabitStatsDialog {
             default:
                 return true;
         }
-    }
-
-    private getHabitGoalType(habit: Habit): "count" | "pomodoro" {
-        return habit.goalType === "pomodoro" ? "pomodoro" : "count";
-    }
-
-    private getHabitPomodoroTargetMinutes(habit: Habit): number {
-        const hours = Math.max(0, Number((habit as any).pomodoroTargetHours) || 0);
-        const minutes = Math.max(0, Number((habit as any).pomodoroTargetMinutes) || 0);
-        const total = (hours * 60) + minutes;
-        if (total > 0) return total;
-        return Math.max(1, Number(habit.target) || 1);
     }
 
     private getHabitPomodoroFocusMinutes(habit: Habit, dateStr: string): number {
@@ -803,15 +777,7 @@ export class HabitStatsDialog {
             // 单击进入该日的历史打卡管理（快速添加/编辑）
             dayCell.addEventListener('click', (e) => {
                 e.stopPropagation();
-                const dayDialog = new HabitDayDialog(this.habit, dateStr, async (updatedHabit) => {
-                    if (this.onSave) {
-                        await this.onSave(updatedHabit);
-                    } else {
-                        this.habit = updatedHabit;
-                    }
-                    this.renderMonthlyView(container);
-                }, this.plugin);
-                dayDialog.show();
+                this.openDayEditor(dateStr);
             });
 
             monthGrid.appendChild(dayCell);
@@ -921,7 +887,7 @@ export class HabitStatsDialog {
             const statCard = document.createElement('div');
             statCard.style.cssText = 'padding:6px; border-radius:8px; background:var(--b3-theme-background); text-align:center;';
             statCard.innerHTML = `
-                <div style="font-size:11px; color:var(--b3-theme-on-surface-light);">${month + 1}月</div>
+                <div style="font-size:11px; color:var(--b3-theme-on-surface-light);">${new Date(year, month, 1).toLocaleDateString(getLocaleTag(), { month: 'short' })}</div>
                 <div style="font-size:14px; font-weight:700; color:var(--b3-theme-primary);">${monthDoneDays}${i18n("habitDays")}</div>
             `;
             monthlyStatsGrid.appendChild(statCard);
@@ -935,7 +901,7 @@ export class HabitStatsDialog {
             row.style.cssText = 'display:grid; grid-template-columns:34px 1fr; align-items:center; gap:4px;';
 
             const label = document.createElement('div');
-            label.textContent = `${month + 1}月`;
+            label.textContent = new Date(year, month, 1).toLocaleDateString(getLocaleTag(), { month: 'short' });
             label.style.cssText = 'font-size:11px; color:var(--b3-theme-on-surface-light); text-align:right;';
             row.appendChild(label);
 
@@ -1012,15 +978,7 @@ export class HabitStatsDialog {
 
                 dayCell.addEventListener('click', (e) => {
                     e.stopPropagation();
-                    const dayDialog = new HabitDayDialog(this.habit, dateStr, async (updatedHabit) => {
-                        if (this.onSave) {
-                            await this.onSave(updatedHabit);
-                        } else {
-                            this.habit = updatedHabit;
-                        }
-                        this.rerenderYearlyView(container);
-                    }, this.plugin);
-                    dayDialog.show();
+                    this.openDayEditor(dateStr);
                 });
 
                 cells.appendChild(dayCell);
@@ -1125,7 +1083,7 @@ export class HabitStatsDialog {
 
         const startWrap = document.createElement('label');
         startWrap.style.cssText = 'display:inline-flex; align-items:center; gap:6px; font-size:13px; color:var(--b3-theme-on-surface-light);';
-        startWrap.textContent = '开始日期';
+        startWrap.textContent = i18n("singleDateDefaultRoleStart");
         const startInput = document.createElement('input');
         startInput.type = 'date';
         startInput.value = this.logStartDate;
@@ -1139,7 +1097,7 @@ export class HabitStatsDialog {
 
         const endWrap = document.createElement('label');
         endWrap.style.cssText = 'display:inline-flex; align-items:center; gap:6px; font-size:13px; color:var(--b3-theme-on-surface-light);';
-        endWrap.textContent = '结束日期';
+        endWrap.textContent = i18n("endDate");
         const endInput = document.createElement('input');
         endInput.type = 'date';
         endInput.value = this.logEndDate;
@@ -1162,11 +1120,11 @@ export class HabitStatsDialog {
             this.renderCheckInLogs(container);
         });
         noteOnlyWrap.appendChild(noteOnlyInput);
-        noteOnlyWrap.appendChild(document.createTextNode('仅看有备注'));
+        noteOnlyWrap.appendChild(document.createTextNode(i18n("onlyWithNotes")));
 
         const resetBtn = document.createElement('button');
         resetBtn.className = 'b3-button b3-button--outline';
-        resetBtn.textContent = '重置筛选';
+        resetBtn.textContent = i18n("resetFilters");
         resetBtn.addEventListener('click', () => {
             this.logStartDate = '';
             this.logEndDate = '';
@@ -1191,7 +1149,7 @@ export class HabitStatsDialog {
 
         const summary = document.createElement('div');
         summary.style.cssText = 'font-size:12px; color:var(--b3-theme-on-surface-light);';
-        summary.textContent = `共 ${filteredLogs.length} 条日志，每页 ${this.logPageSize} 条`;
+        summary.textContent = i18n("habitLogTotal", { count: String(filteredLogs.length), pageSize: String(this.logPageSize) });
         panel.appendChild(summary);
 
         const list = document.createElement('div');
@@ -1200,7 +1158,7 @@ export class HabitStatsDialog {
         if (pageLogs.length === 0) {
             const empty = document.createElement('div');
             empty.style.cssText = 'padding:24px 12px; text-align:center; color:var(--b3-theme-on-surface-light);';
-            empty.textContent = '当前筛选条件下没有打卡日志';
+            empty.textContent = i18n("noCheckInLogsMatching");
             list.appendChild(empty);
         } else {
             pageLogs.forEach(log => {
@@ -1212,7 +1170,7 @@ export class HabitStatsDialog {
 
                 const title = document.createElement('div');
                 title.style.cssText = 'font-size:14px; font-weight:600; color:var(--b3-theme-on-surface);';
-                title.textContent = `${this.habit.icon || "🌱"} ${this.habit.title || "未命名习惯"}`;
+                title.textContent = `${this.habit.icon || "🌱"} ${this.habit.title || i18n("unnamedHabit")}`;
 
                 const meta = document.createElement('div');
                 meta.style.cssText = 'font-size:12px; color:var(--b3-theme-on-surface-light);';
@@ -1227,7 +1185,7 @@ export class HabitStatsDialog {
 
                 const note = document.createElement('span');
                 note.style.cssText = log.hasNote ? '' : 'color:var(--b3-theme-on-surface-light);';
-                note.textContent = log.hasNote ? log.note : '无备注';
+                note.textContent = log.hasNote ? log.note : i18n("noNoteText");
 
                 content.appendChild(emoji);
                 content.appendChild(note);
@@ -1239,17 +1197,9 @@ export class HabitStatsDialog {
                 actions.style.cssText = 'flex-shrink:0;';
                 const openDayBtn = document.createElement('button');
                 openDayBtn.className = 'b3-button b3-button--outline';
-                openDayBtn.textContent = '查看当天';
+                openDayBtn.textContent = i18n("viewThisDay");
                 openDayBtn.addEventListener('click', () => {
-                    const dayDialog = new HabitDayDialog(this.habit, log.dateStr, async (updatedHabit) => {
-                        if (this.onSave) {
-                            await this.onSave(updatedHabit);
-                        } else {
-                            this.habit = updatedHabit;
-                        }
-                        this.renderCheckInLogs(container);
-                    }, this.plugin);
-                    dayDialog.show();
+                    this.openDayEditor(log.dateStr);
                 });
                 actions.appendChild(openDayBtn);
 
@@ -1277,7 +1227,7 @@ export class HabitStatsDialog {
 
         const pageLabel = document.createElement('span');
         pageLabel.style.cssText = 'min-width:120px; text-align:center; font-size:13px;';
-        pageLabel.textContent = `第 ${this.logPage} / ${totalPages} 页`;
+        pageLabel.textContent = i18n("pageOfPages", { page: String(this.logPage), pages: String(totalPages) });
 
         const nextBtn = document.createElement('button');
         nextBtn.className = 'b3-button b3-button--outline';
@@ -1488,9 +1438,37 @@ export class HabitStatsDialog {
         return color;
     }
 
+    private getTimeAxisInterval(containerWidth: number): number {
+        if (containerWidth <= 420) return 6;
+        if (containerWidth <= 720) return 4;
+        return 2;
+    }
+
+    private observeTimeChartResize(chart: EChartsType, container: HTMLElement) {
+        let currentInterval = this.getTimeAxisInterval(container.clientWidth);
+        const resizeObserver = new ResizeObserver(() => {
+            if (!chart || chart.isDisposed()) return;
+
+            const nextInterval = this.getTimeAxisInterval(container.clientWidth);
+            if (nextInterval !== currentInterval) {
+                currentInterval = nextInterval;
+                chart.setOption({
+                    xAxis: {
+                        interval: currentInterval
+                    }
+                });
+            }
+            chart.resize();
+        });
+        resizeObserver.observe(container);
+        this.resizeObservers.push(resizeObserver);
+    }
+
     private renderWeekTimeChart(container: HTMLElement) {
         const chart = init(container);
         this.chartInstances.push(chart);
+        const timeAxisInterval = this.getTimeAxisInterval(container.clientWidth);
+        const isCompactLayout = container.clientWidth <= 720;
 
         const now = new Date();
         const weekStart = this.getWeekStart(now);
@@ -1557,18 +1535,20 @@ export class HabitStatsDialog {
                 formatter: (name: string) => `${name} ${this.getEmojiMeaning(name)}`
             },
             grid: {
-                left: 80,
-                right: 40,
+                left: isCompactLayout ? 8 : 80,
+                right: isCompactLayout ? 8 : 40,
                 top: 60,
-                bottom: 60
+                bottom: 60,
+                containLabel: isCompactLayout
             },
             xAxis: {
                 type: 'value',
                 name: i18n("habitTimeAxisLabel"),
                 min: 0,
                 max: 24,
-                interval: 2,
+                interval: timeAxisInterval,
                 axisLabel: {
+                    hideOverlap: true,
                     formatter: (value: number) => `${Math.floor(value)}:00`
                 }
             },
@@ -1598,18 +1578,13 @@ export class HabitStatsDialog {
         chart.setOption(option);
 
         // 响应式
-        const resizeObserver = new ResizeObserver(() => {
-            if (chart && !chart.isDisposed()) {
-                chart.resize();
-            }
-        });
-        resizeObserver.observe(container);
-        this.resizeObservers.push(resizeObserver);
+        this.observeTimeChartResize(chart, container);
     }
 
     private renderMonthTimeChart(container: HTMLElement) {
         const chart = init(container);
         this.chartInstances.push(chart);
+        const timeAxisInterval = this.getTimeAxisInterval(container.clientWidth);
 
         const now = new Date();
         const targetMonth = new Date(now.getFullYear(), now.getMonth() + this.timeViewOffset, 1);
@@ -1747,8 +1722,9 @@ export class HabitStatsDialog {
                 type: 'value',
                 min: 0,
                 max: 24,
-                interval: 2,
+                interval: timeAxisInterval,
                 axisLabel: {
+                    hideOverlap: true,
                     formatter: (value: number) => `${value}:00`
                 },
                 name: i18n("habitTimeAxisLabel"),
@@ -1772,18 +1748,13 @@ export class HabitStatsDialog {
         chart.setOption(option);
 
         // 响应式
-        const resizeObserver = new ResizeObserver(() => {
-            if (chart && !chart.isDisposed()) {
-                chart.resize();
-            }
-        });
-        resizeObserver.observe(container);
-        this.resizeObservers.push(resizeObserver);
+        this.observeTimeChartResize(chart, container);
     }
 
     private renderYearTimeChart(container: HTMLElement) {
         const chart = init(container);
         this.chartInstances.push(chart);
+        const timeAxisInterval = this.getTimeAxisInterval(container.clientWidth);
 
         const now = new Date();
         const targetYear = now.getFullYear() + this.timeViewOffset;
@@ -1920,8 +1891,9 @@ export class HabitStatsDialog {
                 type: 'value',
                 min: 0,
                 max: 24,
-                interval: 2,
+                interval: timeAxisInterval,
                 axisLabel: {
+                    hideOverlap: true,
                     formatter: (value: number) => `${value}:00`
                 },
                 name: i18n("habitTimeAxisLabel"),
@@ -1945,13 +1917,7 @@ export class HabitStatsDialog {
         chart.setOption(option);
 
         // 响应式
-        const resizeObserver = new ResizeObserver(() => {
-            if (chart && !chart.isDisposed()) {
-                chart.resize();
-            }
-        });
-        resizeObserver.observe(container);
-        this.resizeObservers.push(resizeObserver);
+        this.observeTimeChartResize(chart, container);
     }
 
     private generateColors(count: number): string[] {

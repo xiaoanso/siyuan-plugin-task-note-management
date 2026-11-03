@@ -4,8 +4,8 @@
 @use './styles/pomodoroTimer.scss';
 @use './styles/pomodoroStats.scss';
 @use './styles/calendar.scss';
-@use './styles/taskListStatus.scss';
 @use './styles/projectKanban.scss';
+@use './styles/repeat-settings.scss';
 
 .smart-batch-dialog {
     .b3-dialog__content {
@@ -736,7 +736,7 @@
 
 /* 习惯分组样式 - 现代美化版 */
 .habit-group {
-    margin-bottom: 20px;
+    margin-bottom: 10px;
     animation: slideInUp 0.4s ease forwards;
 }
 
@@ -821,9 +821,9 @@
             var(--b3-theme-background) 0%,
             var(--b3-theme-surface) 100%);
     border: 1px solid var(--b3-theme-surface-lighter);
-    border-radius: 16px;
-    padding: 16px;
-    margin-bottom: 12px;
+    border-radius: 12px;
+    padding: 10px;
+    margin-bottom: 8px;
     cursor: pointer;
     transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
     box-shadow:
@@ -851,8 +851,8 @@
 .habit-card__header {
     display: flex;
     align-items: center;
-    gap: 10px;
-    margin-bottom: 12px;
+    gap: 8px;
+    margin-bottom: 8px;
 }
 
 .habit-card__status-badge {
@@ -877,11 +877,11 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    width: 36px;
-    height: 36px;
+    width: 30px;
+    height: 30px;
     background: linear-gradient(135deg, var(--b3-theme-primary-lightest), var(--b3-theme-surface-light));
-    border-radius: 10px;
-    font-size: 18px;
+    border-radius: 8px;
+    font-size: 16px;
     flex-shrink: 0;
     box-shadow: 0 2px 6px rgba(0, 0, 0, 0.05);
     transition: all 0.2s ease;
@@ -942,14 +942,14 @@
 
 /* 进度条区域 */
 .habit-card__progress {
-    margin-bottom: 14px;
+    margin-bottom: 9px;
 }
 
 .habit-card__progress-header {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    margin-bottom: 8px;
+    margin-bottom: 4px;
 }
 
 .habit-card__progress-label {
@@ -966,7 +966,7 @@
 
 .habit-card__progress-bar {
     width: 100%;
-    height: 8px;
+    height: 6px;
     background: var(--b3-theme-surface-lighter);
     border-radius: 4px;
     overflow: hidden;
@@ -999,8 +999,8 @@
 .habit-card__info-grid {
     display: grid;
     grid-template-columns: repeat(2, 1fr);
-    gap: 8px 16px;
-    margin-bottom: 14px;
+    gap: 4px 12px;
+    margin-bottom: 8px;
 }
 
 .habit-card__info-item {
@@ -1163,8 +1163,8 @@
 /* 今日打卡表情 */
 .habit-card__emoji-section {
     margin-bottom: 1px;
-    padding: 8px;
-    border-radius: 10px;
+    padding: 4px;
+    border-radius: 8px;
     transition: all 0.2s ease;
 }
 
@@ -1176,7 +1176,7 @@
 .habit-card__emoji-label {
     font-size: 11px;
     color: var(--b3-theme-on-surface-light);
-    margin-bottom: 8px;
+    margin-bottom: 4px;
     text-transform: uppercase;
     letter-spacing: 0.5px;
 }
@@ -1184,18 +1184,18 @@
 .habit-card__emoji-list {
     display: flex;
     flex-wrap: wrap;
-    gap: 8px;
+    gap: 4px;
 }
 
 .habit-card__emoji-item {
     display: flex;
     align-items: center;
     justify-content: center;
-    width: 30px;
-    height: 30px;
+    width: 26px;
+    height: 26px;
     background: var(--b3-theme-surface);
-    border-radius: 10px;
-    font-size: 18px;
+    border-radius: 8px;
+    font-size: 16px;
     box-shadow: 0 2px 6px rgba(0, 0, 0, 0.06);
     transition: all 0.2s ease;
     animation: popIn 0.3s ease;
@@ -1222,12 +1222,113 @@
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
 }
 
+.habit-card__week {
+    margin: 6px 0 8px;
+}
+
+.habit-card__week-days {
+    display: grid;
+    grid-template-columns: repeat(7, minmax(0, 1fr));
+    gap: 3px;
+}
+
+.habit-card__week-day {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-width: 0;
+    min-height: 48px;
+    padding: 2px 0;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    background: var(--b3-theme-surface-lighter);
+    color: var(--b3-theme-on-surface);
+    cursor: pointer;
+    font: inherit;
+    line-height: 1.2;
+}
+
+.habit-card__week-day--done {
+    background: color-mix(in srgb, var(--habit-color) 28%, var(--b3-theme-surface));
+}
+
+.habit-card__week-day--not-required {
+    opacity: 0.5;
+}
+
+.habit-card__week-day--today {
+    border-color: var(--b3-theme-primary);
+}
+
+.habit-card__week-day:hover,
+.habit-card__week-day:focus-visible {
+    border-color: var(--b3-theme-primary);
+    opacity: 1;
+}
+
+.habit-card__week-weekday {
+    color: var(--b3-theme-on-surface-light);
+    font-size: 10px;
+}
+
+.habit-card__week-date {
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.habit-card__week-status {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    align-content: center;
+    justify-content: center;
+    width: 100%;
+    min-height: 14px;
+    gap: 0 1px;
+    font-size: 11px;
+    line-height: 1;
+}
+
+.habit-card__week-status--few {
+    font-size: 13px;
+}
+
+.habit-card__week-status--medium {
+    font-size: 11px;
+}
+
+.habit-card__week-status--many {
+    font-size: 9px;
+}
+
+.habit-card__week-status > span {
+    flex: none;
+}
+
+.habit-day-dialog__week {
+    flex-shrink: 0;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--b3-border-color);
+
+    .habit-card__week-day {
+        min-height: 64px;
+        gap: 4px;
+    }
+
+    .habit-day-dialog__week-day--selected {
+        border-color: var(--b3-theme-primary);
+        box-shadow: inset 0 0 0 1px var(--b3-theme-primary);
+        opacity: 1;
+    }
+}
+
 /* 底部操作区 */
 .habit-card__footer {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    padding-top: 14px;
+    padding-top: 8px;
     border-top: 1px solid var(--b3-theme-surface-lighter);
 }
 
@@ -1253,13 +1354,13 @@
 .habit-card__checkin-btn {
     display: inline-flex;
     align-items: center;
-    gap: 6px;
-    padding: 8px 16px;
+    gap: 4px;
+    padding: 5px 10px;
     background: linear-gradient(135deg, var(--b3-theme-primary), var(--b3-theme-primary-light));
     color: white;
     border: none;
-    border-radius: 10px;
-    font-size: 13px;
+    border-radius: 8px;
+    font-size: 12px;
     font-weight: 600;
     cursor: pointer;
     transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
@@ -1343,7 +1444,6 @@
     background: linear-gradient(90deg, #2ecc71, #27ae60);
 }
 
-.habit-panel>.habit-header,
 .reminder-panel>.reminder-header {
     margin-bottom: 12px;
 }
@@ -1773,7 +1873,7 @@
 
 .mobile-task-shortcut {
     position: fixed;
-    left: calc(16px + env(safe-area-inset-left));
+    right: -26px;
     bottom: calc(72px + env(safe-area-inset-bottom));
     width: 52px;
     height: 52px;
@@ -1790,6 +1890,7 @@
     cursor: pointer;
     touch-action: manipulation;
     -webkit-tap-highlight-color: transparent;
+    transition: transform 0.15s ease, box-shadow 0.15s ease;
 
     &:active {
         transform: scale(0.96);
@@ -1800,6 +1901,11 @@
         box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
         opacity: 0.9;
         transition: none;
+    }
+
+    &--docked-left,
+    &--docked-right {
+        opacity: 0.92;
     }
 }
 
@@ -1829,27 +1935,114 @@
     font-weight: 700;
     line-height: 18px;
     pointer-events: none;
+    transition: left 0.15s ease, right 0.15s ease;
+
+    .mobile-task-shortcut--docked-right & {
+        left: -4px;
+        right: auto;
+    }
+
+    &--habit {
+        top: auto;
+        bottom: -4px;
+        background: var(--b3-theme-success, #2e7d32);
+    }
 }
 
 .mobile-task-shortcut-dialog {
     .b3-dialog__content {
         padding: 0;
         overflow: hidden;
+        display: flex;
+        flex-direction: column;
+        height: 100%;
     }
 
-    #mobileTaskShortcutPanelContainer {
-        height: 100%;
+    #mobileTaskShortcutPanelContainer,
+    #mobileTaskShortcutPanels {
+        flex: 1;
+        min-height: 0;
         width: 100%;
         overflow: hidden;
     }
 
-    .reminder-panel {
+    .mobile-task-shortcut-tabs {
+        display: flex;
+        align-items: center;
+        justify-content: space-around;
+        gap: 4px;
+        padding: 6px 8px;
+        border-bottom: 1px solid var(--b3-border-color);
+        background: var(--b3-theme-background);
+        flex-shrink: 0;
+    }
+
+    .mobile-task-shortcut-tab {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 2px;
+        padding: 6px 4px;
+        border: none;
+        border-radius: 8px;
+        background: transparent;
+        color: var(--b3-theme-on-surface);
+        font-size: 11px;
+        line-height: 1.2;
+        cursor: pointer;
+        touch-action: manipulation;
+        -webkit-tap-highlight-color: transparent;
+        transition: background 0.15s ease, color 0.15s ease;
+
+        &__icon {
+            width: 20px;
+            height: 20px;
+            fill: currentColor;
+            pointer-events: none;
+        }
+
+        &__label {
+            pointer-events: none;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 100%;
+        }
+
+        &--active,
+        &:active {
+            background: color-mix(in srgb, var(--b3-theme-primary) 16%, transparent);
+            color: var(--b3-theme-primary);
+        }
+    }
+
+    .mobile-task-shortcut-panel {
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+    }
+
+    .reminder-panel,
+    .project-panel,
+    .habit-panel,
+    .TN-reminder-calendar-view {
         height: 100%;
         box-sizing: border-box;
     }
 
-    .reminder-title {
-        display: none;
+    .reminder-title,
+    .project-title,
+    .habit-title {
+        display: none !important;
+    }
+
+    .reminder-calendar-toolbar {
+        flex-shrink: 0;
+        padding: 4px 6px;
+        gap: 4px;
+        flex-wrap: wrap;
     }
 }
 

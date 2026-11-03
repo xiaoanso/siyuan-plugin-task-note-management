@@ -107,6 +107,8 @@
     /* 最小化视图样式 */
     &.minimized {
         overflow: visible !important;
+        box-sizing: border-box;
+        border: none !important;
         padding: 0 !important;
         background: transparent !important;
 
@@ -123,9 +125,13 @@
             justify-content: center;
             position: relative;
             overflow: hidden;
+            border-radius: inherit;
         }
 
         .pomodoro-minimized-card {
+            // 100% 尺寸包含 padding 和边框，防止右侧、底部被视图裁切。
+            box-sizing: border-box;
+            overflow: hidden;
             position: absolute;
             top: 0;
             left: 0;
@@ -236,12 +242,16 @@
             display: flex;
         }
 
+        // 触屏没有 hover，恢复和极简模式的播放操作必须始终可点。
+        &.is-mobile .pomodoro-restore-btn {
+            display: flex !important;
+        }
+
         &.minimized-style-ring {
             width: 60px !important;
             height: 60px !important;
             border-radius: 50% !important;
-            border: 2px solid rgba(255, 255, 255, 0.3) !important;
-            backdrop-filter: blur(8px) !important;
+            border: 2px solid var(--b3-theme-border) !important;
             box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2) !important;
 
             .pomodoro-minimized-view,
@@ -262,7 +272,7 @@
                 left: 2px;
                 right: 2px;
                 bottom: 2px;
-                background: rgba(255, 255, 255, 0.9);
+                background: var(--b3-theme-surface) !important;
             }
 
             .pomodoro-minimized-icon {
@@ -279,33 +289,33 @@
             }
 
             .pomodoro-restore-btn {
-                top: 25px;
-                right: 21px;
+                top: 2px;
+                right: 2px;
                 width: 15px;
                 height: 15px;
                 font-size: 10px;
             }
 
             .b3-theme-dark & {
-                border-color: rgba(255, 255, 255, 0.2) !important;
+                border-color: var(--b3-theme-border) !important;
 
                 .pomodoro-minimized-overlay {
-                    background: rgba(30, 30, 30, 0.9);
+                    background: var(--b3-theme-surface) !important;
                 }
             }
         }
 
         &.minimized-style-horizontal {
-            width: 150px !important;
-            height: 42px !important;
+            width: var(--pomodoro-mini-width, 150px) !important;
+            height: var(--pomodoro-mini-height, 32px) !important;
             border-radius: 10px !important;
-            backdrop-filter: blur(8px) !important;
             box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15) !important;
 
             .pomodoro-minimized-card {
                 border-radius: 10px;
-                border: 1px solid var(--b3-theme-border);
-                padding: 3px 8px;
+                background: linear-gradient(135deg, var(--b3-theme-surface), var(--b3-theme-background));
+                box-shadow: inset 0 0 0 1px var(--b3-theme-border);
+                padding: 7px 8px 2px;
                 gap: 6px;
             }
 
@@ -317,21 +327,21 @@
 
             .pomodoro-minimized-bar-layout {
                 display: flex !important;
-                align-items: center;
+                align-items: flex-end;
                 gap: 6px;
             }
 
             .pomodoro-minimized-mode-btn {
                 display: inline-flex !important;
-                width: 18px;
-                height: 18px;
+                width: 14px;
+                height: 14px;
                 border-radius: 5px;
                 align-items: center;
                 justify-content: center;
-                background: rgba(255, 255, 255, 0.15);
+                background: rgba(255, 255, 255, 0.48);
                 border: none;
                 color: var(--b3-theme-on-surface);
-                font-size: 12px;
+                font-size: 10px;
                 padding: 0;
                 flex-shrink: 0;
             }
@@ -343,15 +353,18 @@
 
             .pomodoro-minimized-title {
                 display: block !important;
+                position: absolute;
+                top: 2px;
+                left: 8px;
+                right: 26px;
                 font-size: 9px;
-                font-weight: 500;
+                font-weight: 600;
                 color: var(--b3-theme-on-surface);
-                opacity: 0.65;
+                opacity: 0.68;
                 overflow: hidden;
                 text-overflow: ellipsis;
                 white-space: nowrap;
                 line-height: 1.1;
-                width: 100%;
             }
 
             .pomodoro-minimized-time {
@@ -373,7 +386,8 @@
             }
 
             .pomodoro-minimized-progress-track {
-                height: 3px;
+                height: 2px;
+                flex-shrink: 0;
                 border-radius: 2px;
             }
 
@@ -383,25 +397,51 @@
             }
 
             .pomodoro-minimized-action-btn {
-                width: 16px;
-                height: 16px;
+                width: 14px;
+                height: 14px;
                 border-radius: 4px;
                 font-size: 9px;
                 padding: 0;
             }
 
             .pomodoro-restore-btn {
-                top: 2px;
-                right: 2px;
-                width: 14px;
-                height: 14px;
-                font-size: 8px;
+                top: 4px;
+                right: 4px;
+                width: 16px;
+                height: 16px;
+                font-size: 9px;
+            }
+
+            &.is-mobile {
+                height: max(var(--pomodoro-mini-height, 32px), 36px) !important;
+
+                .pomodoro-minimized-title {
+                    font-size: 11px;
+                }
+
+                .pomodoro-minimized-time {
+                    font-size: 14px;
+                }
+
+                .pomodoro-minimized-mode-btn,
+                .pomodoro-minimized-action-btn {
+                    width: 16px;
+                    height: 16px;
+                }
+
+                .pomodoro-minimized-mode-btn {
+                    font-size: 12px;
+                }
+
+                .pomodoro-minimized-action-btn {
+                    font-size: 10px;
+                }
             }
         }
 
         &.minimized-style-minimal {
-            width: 150px !important;
-            height: 26px !important;
+            width: var(--pomodoro-mini-width, 130px) !important;
+            height: var(--pomodoro-mini-height, 22px) !important;
             border-radius: 8px !important;
             box-shadow: none !important;
 
@@ -457,7 +497,8 @@
                 transition: opacity 0.18s ease;
             }
 
-            &:hover .pomodoro-minimized-actions {
+            &:hover .pomodoro-minimized-actions,
+            &.is-mobile .pomodoro-minimized-actions {
                 opacity: 1;
                 pointer-events: auto;
             }
@@ -519,11 +560,10 @@
             z-index: 1001;
             opacity: 0;
             transition: opacity 0.3s ease;
-            background: rgba(var(--b3-theme-background-rgb), 0.9) !important;
-            backdrop-filter: blur(10px) !important;
+            background: var(--b3-theme-background) !important;
             padding: 20px 40px !important;
             border-radius: 0 !important;
-            border-bottom: 2px solid rgba(255, 255, 255, 0.1) !important;
+            border-bottom: 2px solid var(--b3-theme-border) !important;
             justify-content: center !important;
 
             // 悬浮时显示
@@ -552,16 +592,15 @@
             font-size: 24px !important;
             padding: 16px 24px !important;
             border-radius: 12px !important;
-            background: rgba(255, 255, 255, 0.1) !important;
-            border: 2px solid rgba(255, 255, 255, 0.2) !important;
-            backdrop-filter: blur(8px) !important;
+            background: var(--b3-theme-surface) !important;
+            border: 2px solid var(--b3-theme-border) !important;
             transition: all 0.3s ease !important;
             min-width: 80px !important;
             min-height: 60px !important;
 
             &:hover {
-                background: rgba(255, 255, 255, 0.2) !important;
-                border-color: rgba(255, 255, 255, 0.4) !important;
+                background: var(--b3-theme-surface-lighter) !important;
+                border-color: var(--b3-theme-primary) !important;
                 transform: scale(1.05) !important;
             }
         }
@@ -583,9 +622,8 @@
             font-size: 5vh !important;
             margin-bottom: 5vh !important;
             padding: 2vh 4vw !important;
-            background: rgba(255, 255, 255, 0.1) !important;
+            background: var(--b3-theme-surface) !important;
             border: 2px solid var(--b3-table-border-color) !important;
-            backdrop-filter: blur(10px) !important;
             border-radius: 12px !important;
             font-family: var(--b3-font-family) !important;
         }
@@ -688,8 +726,8 @@
             transform: translateX(-50%) !important;
             width: 50% !important;
             max-width: 1000px !important;
-            border: 2px solid rgba(255, 255, 255, 0.2) !important;
-            backdrop-filter: blur(10px) !important;
+            background: var(--b3-theme-surface) !important;
+            border: 2px solid var(--b3-theme-border) !important;
             border-radius: 20px !important;
             padding: 20px 40px !important;
             opacity: 1 !important;
@@ -880,8 +918,9 @@
     position: fixed;
     top: 30px;
     right: 30px;
-    background: rgba(255, 255, 255, 0.1);
-    border: 2px solid rgba(255, 255, 255, 0.3);
+    background: var(--b3-theme-surface);
+    border: 2px solid var(--b3-theme-border);
+    color: var(--b3-theme-on-surface);
     cursor: pointer;
     padding: 12px 20px;
     border-radius: 8px;
@@ -889,11 +928,10 @@
     font-weight: 600;
     z-index: 10001;
     transition: all 0.3s ease;
-    backdrop-filter: blur(8px);
 
     &:hover {
-        background: rgba(255, 255, 255, 0.2);
-        border-color: rgba(255, 255, 255, 0.5);
+        background: var(--b3-theme-surface-lighter);
+        border-color: var(--b3-theme-primary);
     }
 
     @media (max-width: 768px) {

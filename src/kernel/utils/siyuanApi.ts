@@ -129,12 +129,10 @@ export async function isTaskListLikeBlock(blockId: string): Promise<boolean> {
         const result = await sql(`SELECT type, subtype FROM blocks WHERE id = '${blockId}'`);
         if (result && result.length > 0) {
             const block = result[0];
-            if (block.type === 'i' && block.subtype === 't') {
-                return true;
+            if (block.type === 'i') {
+                return block.subtype === 't';
             }
-            if (block.type !== 'i') {
-                return false;
-            }
+            return false;
         }
 
         const kramdown = (await getBlockKramdown(blockId)).kramdown || '';
@@ -142,7 +140,7 @@ export async function isTaskListLikeBlock(blockId: string): Promise<boolean> {
         return /^\s*[-*+]\s*(?:\{:[^}]*\}\s*)?\[(?: |x|X)\]/m.test(kramdown)
             || /^\s*[-*+]\s*\[(?: |x|X)\](?:\s*\{:[^}]*\})?/m.test(kramdown);
     } catch (error) {
-        console.warn('检测任务列表块失败:', error);
+        console.warn("Failed to detect task list block:", error);
         return false;
     }
 }
@@ -181,10 +179,14 @@ function getTaskListMarkerByReminders(reminders: any[], syncDoingAndAbandoned: b
 async function syncTaskListBlockCompletion(blockId: string, reminders: any[], syncDoingAndAbandoned: boolean = true): Promise<void> {
     const isTaskList = await isTaskListLikeBlock(blockId);
     if (isTaskList) {
-        await batchUpdateTaskListItemMarker([{
-            id: blockId,
-            marker: getTaskListMarkerByReminders(reminders, syncDoingAndAbandoned)
-        }]);
+        try {
+            await batchUpdateTaskListItemMarker([{
+                id: blockId,
+                marker: getTaskListMarkerByReminders(reminders, syncDoingAndAbandoned)
+            }]);
+        } catch (err) {
+            console.warn("Failed to sync task list block marker:", blockId, err);
+        }
         return;
     }
 
@@ -193,11 +195,15 @@ async function syncTaskListBlockCompletion(blockId: string, reminders: any[], sy
         const children = await getChildBlocks(blockId);
         if (children && children.length === 1) {
             const child = children[0];
-            if (child.type === 'i') {
-                await batchUpdateTaskListItemMarker([{
-                    id: child.id,
-                    marker: getTaskListMarkerByReminders(reminders, syncDoingAndAbandoned)
-                }]);
+            if (child && child.id && await isTaskListLikeBlock(child.id)) {
+                try {
+                    await batchUpdateTaskListItemMarker([{
+                        id: child.id,
+                        marker: getTaskListMarkerByReminders(reminders, syncDoingAndAbandoned)
+                    }]);
+                } catch (err) {
+                    console.warn("Failed to sync subtask list block marker:", child.id, err);
+                }
             }
         }
     }
@@ -249,11 +255,27 @@ export async function updateBindBlockAtrrs(blockId: string, bridge: any): Promis
 
         if (blockReminders.length === 0) {
             try {
-                await setBlockAttrs(blockId, {
+                const cleanupAttrs: { [key: string]: string } = {
                     "bookmark": "",
                     'custom-bind-reminders': '',
                     'custom-task-projectId': ''
-                });
+                };
+
+                try {
+                    const { PomodoroRecordManager } = await import("../../components/dataManager/pomodoroRecord");
+                    const pomodoroManager = PomodoroRecordManager.getInstance(bridge);
+                    if (pomodoroManager) {
+                        await pomodoroManager.initialize();
+                        const ownCount = pomodoroManager.getRepeatingEventTotalPomodoroCount(blockId);
+                        const ownMinutes = pomodoroManager.getRepeatingEventTotalFocusTime(blockId);
+                        cleanupAttrs['custom-task-pomodoro-count'] = ownCount > 0 ? String(ownCount) : '';
+                        cleanupAttrs['custom-task-pomodoro-minutes'] = ownMinutes > 0 ? String(ownMinutes) : '';
+                    }
+                } catch (pomoErr) {
+                    console.warn("Failed to clear block attributes and calculate own pomodoros:", blockId, pomoErr);
+                }
+
+                await setBlockAttrs(blockId, cleanupAttrs);
                 return;
             } catch (err) {
                 console.warn('clean up block attributes failed for', blockId, err);
@@ -283,6 +305,65 @@ export async function updateBindBlockAtrrs(blockId: string, bridge: any): Promis
         const projectIds = Array.from(new Set(blockReminders.map((r: any) => r.projectId).filter(id => id)));
         attrs['custom-task-projectId'] = projectIds.length > 0 ? projectIds.join(',') : '';
 
+        try {
+            const { PomodoroRecordManager } = await import("../../components/dataManager/pomodoroRecord");
+            const pomodoroManager = PomodoroRecordManager.getInstance(bridge);
+            if (pomodoroManager) {
+                await pomodoroManager.initialize();
+
+                let totalPomoCount = pomodoroManager.getRepeatingEventTotalPomodoroCount(blockId);
+                let totalPomoMinutes = pomodoroManager.getRepeatingEventTotalFocusTime(blockId);
+
+                // 加上当前仍绑定在该块上的所有任务的番茄（含子任务，最多2层深度）
+                const processedTaskSeries = new Set<string>();
+
+                // 只有后缀是 YYYY-MM-DD 时才去掉（重复任务实例），其他情况保留完整 ID
+                const getSeriesBaseId = (id: string): string => {
+                    const m = id.match(/^(.+)_(\d{4}-\d{2}-\d{2})$/);
+                    return m ? m[1] : id;
+                };
+
+                // 预建 parentId -> [childId] 索引（基于 reminder 的 parentId 字段）
+                const childrenByParentId = new Map<string, string[]>();
+                for (const rem of Object.values(reminderData) as any[]) {
+                    if (!rem || !rem.parentId || !rem.id) continue;
+                    const parentBase = getSeriesBaseId(String(rem.parentId));
+                    if (!childrenByParentId.has(parentBase)) childrenByParentId.set(parentBase, []);
+                    childrenByParentId.get(parentBase)!.push(rem.id);
+                }
+
+                // 辅助：收集一批任务 ID 的番茄，并递归收集其子任务（深度限制 maxDepth）
+                const collectPomodoroForIds = (ids: string[], depth: number) => {
+                    if (depth > 2) return;
+                    for (const id of ids) {
+                        if (!id) continue;
+                        const baseId = getSeriesBaseId(id);
+                        if (processedTaskSeries.has(baseId)) continue;
+                        processedTaskSeries.add(baseId);
+                        // 使用 getRepeatingEventTotalPomodoroCount 可同时覆盖非重复和重复任务的全部实例
+                        totalPomoCount += pomodoroManager.getRepeatingEventTotalPomodoroCount(baseId);
+                        totalPomoMinutes += pomodoroManager.getRepeatingEventTotalFocusTime(baseId);
+                        // 通过 parentId 索引递归子任务
+                        const childIds = childrenByParentId.get(baseId);
+                        if (childIds?.length) {
+                            collectPomodoroForIds(childIds, depth + 1);
+                        }
+                    }
+                };
+
+                for (const r of blockReminders) {
+                    const seriesId = r.originalId || getSeriesBaseId(r.id || '');
+                    if (!seriesId) continue;
+                    collectPomodoroForIds([seriesId], 0);
+                }
+
+                attrs['custom-task-pomodoro-count'] = totalPomoCount > 0 ? String(totalPomoCount) : '';
+                attrs['custom-task-pomodoro-minutes'] = totalPomoMinutes > 0 ? String(totalPomoMinutes) : '';
+            }
+        } catch (pomoErr) {
+            console.warn("Failed to calculate/update block pomodoro attributes:", blockId, pomoErr);
+        }
+
         await setBlockAttrs(blockId, attrs);
 
         try {
@@ -290,10 +371,10 @@ export async function updateBindBlockAtrrs(blockId: string, bridge: any): Promis
             const syncDoingAndAbandoned = settings?.enableTaskListStatusSync !== false;
             await syncTaskListBlockCompletion(blockId, blockReminders as any[], syncDoingAndAbandoned);
         } catch (syncErr) {
-            console.warn('同步任务列表块勾选状态失败:', blockId, syncErr);
+            console.warn("Failed to sync task list block check state:", blockId, syncErr);
         }
 
     } catch (error) {
-        console.error('更新块提醒书签失败:', error);
+        console.error("Failed to update block reminder bookmark:", error);
     }
 }

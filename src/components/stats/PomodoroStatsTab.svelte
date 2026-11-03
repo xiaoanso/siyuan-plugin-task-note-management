@@ -8,7 +8,7 @@ let statsView: any = null;
 import { Dialog } from "siyuan";
 import { showMessage } from "siyuan";
 import { confirm } from "siyuan";
-import { PomodoroRecordManager } from "../../utils/pomodoroRecord";
+import { PomodoroRecordManager } from "../dataManager/pomodoroRecord";
 import { i18n } from "../../pluginInstance";
 import { getLocalDateString, getLogicalDateString, getDayStartMinutes, getLocaleTag } from "../../utils/dateUtils";
 import { init, use } from 'echarts/core';
@@ -101,9 +101,32 @@ class PomodoroStatsView {
 
     private formatTimelineHour(valueHours: number): string {
         const totalMinutes = Math.round(valueHours * 60 + this.getLogicalTimelineStartMinutes());
-        const hours = Math.floor(totalMinutes / 60);
-        const minutes = totalMinutes % 60;
+        const normalizedMinutes = ((totalMinutes % 1440) + 1440) % 1440;
+        const hours = Math.floor(normalizedMinutes / 60);
+        const minutes = normalizedMinutes % 60;
         return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
+    }
+
+    private getTimelineAxisInterval(containerWidth: number): number {
+        if (containerWidth <= 420) return 6;
+        if (containerWidth <= 720) return 4;
+        return 2;
+    }
+
+    private getHeatmapCalendarLayout(containerWidth: number) {
+        const isCompact = containerWidth <= 720;
+        const isNarrow = containerWidth <= 480;
+        const left = isCompact ? 24 : 40;
+        const right = isCompact ? 8 : 20;
+        const cellSize = Math.max(4, Math.min(13, Math.floor((containerWidth - left - right) / 53)));
+        return {
+            left,
+            cellSize,
+            monthNameMap: isNarrow
+                ? [i18n("january"), '', i18n("march"), '', i18n("may"), '', i18n("july"), '', i18n("september"), '', i18n("november"), '']
+                : 'ZH',
+            monthFontSize: isCompact ? 10 : 11
+        };
     }
 
     private createContent(): string {
@@ -435,9 +458,9 @@ class PomodoroStatsView {
         const date = new Date(session.startTime);
         const dateStr = date.toLocaleDateString(getLocaleTag());
         const timeStr = date.toLocaleTimeString(getLocaleTag(), { hour: '2-digit', minute: '2-digit' });
-        const durationText = session.inProgress ? "待补录" : `${session.duration}${i18n("minutes")}`;
+        const durationText = session.inProgress ? i18n("toRecord") : i18n('durationMinutesNoSpace', { minutes: String(session.duration) });
         const statusText = session.inProgress
-            ? '<span class="record-incomplete">待补录</span>'
+            ? `<span class="record-incomplete">${i18n("toRecord")}</span>`
             : (session.completed ? '<span class="record-completed">✅</span>' : '<span class="record-incomplete">⏸</span>');
         const note = String(session.note || "").trim();
         const noteHtml = note
@@ -1241,6 +1264,7 @@ class PomodoroStatsView {
 
             // 初始化echarts实例
             const chart = init(chartElement);
+            let heatmapLayout = this.getHeatmapCalendarLayout(chartElement.clientWidth);
 
             // 准备热力图数据
             const startDate = new Date(this.currentYear, 0, 1);
@@ -1312,10 +1336,8 @@ class PomodoroStatsView {
                 },
                 calendar: {
                     top: 50,
-                    left: 40,
-                    right: 20,
-                    bottom: 60,
-                    cellSize: 13,
+                    left: heatmapLayout.left,
+                    cellSize: [heatmapLayout.cellSize, heatmapLayout.cellSize],
                     range: this.currentYear,
                     itemStyle: {
                         borderWidth: 2,
@@ -1324,8 +1346,8 @@ class PomodoroStatsView {
                     },
                     yearLabel: { show: false },
                     monthLabel: {
-                        nameMap: 'ZH',
-                        fontSize: 11
+                        nameMap: heatmapLayout.monthNameMap,
+                        fontSize: heatmapLayout.monthFontSize
                     },
                     dayLabel: {
                         firstDay: 1,
@@ -1352,6 +1374,17 @@ class PomodoroStatsView {
             // 响应式调整
             const resizeObserver = new ResizeObserver(() => {
                 if (chart && !chart.isDisposed()) {
+                    heatmapLayout = this.getHeatmapCalendarLayout(chartElement.clientWidth);
+                    chart.setOption({
+                        calendar: {
+                            left: heatmapLayout.left,
+                            cellSize: [heatmapLayout.cellSize, heatmapLayout.cellSize],
+                            monthLabel: {
+                                nameMap: heatmapLayout.monthNameMap,
+                                fontSize: heatmapLayout.monthFontSize
+                            }
+                        }
+                    });
                     chart.resize();
                 }
             });
@@ -1381,6 +1414,7 @@ class PomodoroStatsView {
 
             // 初始化echarts实例
             const chart = init(chartElement);
+            let timelineAxisInterval = this.getTimelineAxisInterval(chartElement.clientWidth);
 
             // 准备时间线数据
             const dates = timelineData.map(d => d.date);
@@ -1557,8 +1591,9 @@ class PomodoroStatsView {
                     type: 'value',
                     min: 0,
                     max: 24,
-                    interval: 2,
+                    interval: timelineAxisInterval,
                     axisLabel: {
+                        hideOverlap: true,
                         formatter: (value) => {
                             return this.formatTimelineHour(value);
                         }
@@ -1589,6 +1624,15 @@ class PomodoroStatsView {
             // 响应式调整
             const resizeObserver = new ResizeObserver(() => {
                 if (chart && !chart.isDisposed()) {
+                    const nextInterval = this.getTimelineAxisInterval(chartElement.clientWidth);
+                    if (nextInterval !== timelineAxisInterval) {
+                        timelineAxisInterval = nextInterval;
+                        chart.setOption({
+                            xAxis: {
+                                interval: timelineAxisInterval
+                            }
+                        });
+                    }
                     chart.resize();
                 }
             });
@@ -1651,9 +1695,9 @@ class PomodoroStatsView {
                     <div class="b3-form__group">
                         <label class="b3-form__label">${i18n("sessionType") || "会话类型"}</label>
                         <select id="editStatsSessionType" class="b3-select" style="width: 100%;">
-                            <option value="work">🍅 工作番茄</option>
-                            <option value="shortBreak">☕ 短休息</option>
-                            <option value="longBreak">🌴 长休息</option>
+                            <option value="work">${i18n("pomodoroWorkType")}</option>
+                            <option value="shortBreak">${i18n("pomodoroShortBreakType")}</option>
+                            <option value="longBreak">${i18n("pomodoroLongBreakType")}</option>
                         </select>
                     </div>
                     <div class="b3-form__group">
@@ -1666,7 +1710,7 @@ class PomodoroStatsView {
                     </div>
                     <div class="b3-form__group">
                         <label class="b3-form__label">${i18n("note") || "备注"}</label>
-                        <textarea id="editStatsSessionNote" class="b3-text-field" rows="3" style="width: 100%; resize: vertical;" placeholder="这次专注完成了什么？">${this.escapeHtml(session.note || "")}</textarea>
+                        <textarea id="editStatsSessionNote" class="b3-text-field" rows="3" style="width: 100%; resize: vertical;" placeholder="${i18n("pomodoroNotePlaceholder")}">${this.escapeHtml(session.note || "")}</textarea>
                     </div>
                     <div class="b3-dialog__action">
                         <button class="b3-button b3-button--cancel">${i18n("cancel")}</button>
@@ -1737,7 +1781,7 @@ class PomodoroStatsView {
                     showMessage(i18n("editPomodoroFailed") || "修改番茄钟失败", 3000, "error");
                 }
             } catch (error) {
-                console.error('修改会话失败:', error);
+                console.error("Failed to modify session:", error);
                 showMessage(i18n("editPomodoroFailed") || "修改番茄钟失败", 3000, "error");
             }
         });
@@ -1822,7 +1866,7 @@ class PomodoroStatsView {
                 showMessage(i18n("deleteFailed"), 3000, "error");
             }
         } catch (error) {
-            console.error('删除会话失败:', error);
+            console.error("Failed to delete session:", error);
             showMessage(i18n("deleteFailed"), 3000, "error");
         }
     }

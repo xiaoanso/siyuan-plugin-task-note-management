@@ -177,6 +177,7 @@ Notes should not exist merely for copying and storing. They should exist for cre
 - **Pomodoro timer**: On desktop, a global floating Pomodoro window can run outside SiYuan Notes. Supports Pomodoro focus for tasks and arbitrary blocks, Pomodoro statistics, and calendar display of Pomodoro data.
 - **Habit tracking**: List the habits you want to cultivate, support recurring reminders, support goal types based on either check-in count or Pomodoro duration, and provide data statistics.
 
+
 ## ❤️ Acknowledgments
 
 - fullcalendar: calendar view development

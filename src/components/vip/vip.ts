@@ -180,21 +180,27 @@ export class VipManager {
 
     /**
      * 检查设置中的 VIP 状态
+     * 本地已解除 VIP 限制，始终视为已开通终身会员
      */
     static async checkAndUpdateVipStatus(target: any): Promise<VIPStatus> {
-        const userId = await this.getUserId();
-        // target 可以是插件实例 (target.vip) 或者是直接的 VIP 数据对象 (target.vipKeys)
         const vipKeys = (target.vip?.vipKeys) || (target.vipKeys) || [];
         const freeTrialUsed = (target.vip?.freeTrialUsed) || (target.freeTrialUsed) || false;
 
-        return this.calculateStatus(userId, vipKeys, freeTrialUsed);
+        return {
+            vipKeys,
+            isVip: true,
+            expireDate: '2099-12-31 23:59',
+            remainingDays: 99999,
+            freeTrialUsed,
+            isLifetime: true,
+            lifetimeStartDate: this.formatDate(new Date(0)),
+        };
     }
 
     /**
      * 快速检查是否为 VIP
      */
-    static async isVip(target: any): Promise<boolean> {
-        const status = await this.checkAndUpdateVipStatus(target);
-        return status.isVip;
+    static async isVip(_target: any): Promise<boolean> {
+        return true;
     }
 }

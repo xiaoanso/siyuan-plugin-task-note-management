@@ -424,7 +424,7 @@ export default class ReminderPlugin extends Plugin {
     private coordinatorChannel: BroadcastChannel;
 
     public settings: any;
-    public vip: any = { vipKeys: [], isVip: false, expireDate: '', freeTrialUsed: false };
+    public vip: any = { vipKeys: [], isVip: true, expireDate: '2099-12-31 23:59', freeTrialUsed: false };
     public isInMobileApp: boolean = false; // 是否在移动端（手机或平板）运行
 
     public getWorkspaceDir(): string {
@@ -868,16 +868,16 @@ export default class ReminderPlugin extends Plugin {
                 if (data && data.vipKeys && data.vipKeys.length > 0) {
                     this.vip = data;
                 } else {
-                    this.vip = { vipKeys: [], isVip: false, expireDate: '', freeTrialUsed: data?.freeTrialUsed || false };
+                    this.vip = { vipKeys: [], isVip: true, expireDate: '2099-12-31 23:59', freeTrialUsed: data?.freeTrialUsed || false };
                 }
 
-                // 验证状态
+                // 验证状态（本地已解除 VIP 限制，始终开通）
                 const status = await VipManager.checkAndUpdateVipStatus(this);
                 this.vip.isVip = status.isVip;
                 this.vip.expireDate = status.expireDate;
             } catch (error) {
                 console.error('Failed to load VIP data:', error);
-                this.vip = { vipKeys: [], isVip: false, expireDate: '', freeTrialUsed: false };
+                this.vip = { vipKeys: [], isVip: true, expireDate: '2099-12-31 23:59', freeTrialUsed: false };
             }
         }
         return this.vip;

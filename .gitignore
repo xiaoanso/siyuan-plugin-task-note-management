@@ -10,4 +10,7 @@ dist
 build
 tmp
 .wrangler
+.agents/skills/
 参考/
+.env
+.vscode
